@@ -347,11 +347,35 @@ impl MmEngine {
             self.cfg.max_spread_bps,
         );
 
-        // Cancel any leftover orders on startup
+        // Clean slate on startup: cancel all orders and close all positions
         self.cancel_all_main_orders().await;
-
-        // Sync inventory from exchange position
-        self.sync_inventory_from_exchange().await;
+        log::info!("[MM] Closing all main positions on startup...");
+        if let Err(e) = self
+            .main_conn
+            .close_all_positions(Some(self.cfg.symbol.clone()))
+            .await
+        {
+            log::warn!("[MM] Failed to close main positions on startup: {:?}", e);
+        }
+        if let Some(ref hedge) = self.hedge_conn {
+            log::info!("[MM] Cancelling hedge orders on startup...");
+            if let Err(e) = hedge
+                .cancel_all_orders(Some(self.cfg.symbol.clone()))
+                .await
+            {
+                log::warn!("[MM] Failed to cancel hedge orders on startup: {:?}", e);
+            }
+            log::info!("[MM] Closing hedge positions on startup...");
+            if let Err(e) = hedge
+                .close_all_positions(Some(self.cfg.symbol.clone()))
+                .await
+            {
+                log::warn!("[MM] Failed to close hedge positions on startup: {:?}", e);
+            }
+        }
+        self.inventory = 0.0;
+        self.hedge_position = 0.0;
+        self.realized_pnl = 0.0;
 
         // Allow websocket to warm up
         sleep(Duration::from_secs(3)).await;
