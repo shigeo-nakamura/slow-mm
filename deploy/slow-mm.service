@@ -1,0 +1,14 @@
+[Unit]
+Description="slow-mm"
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/slow-mm
+ExecStart=/bin/bash /opt/slow-mm/scripts/slow-mm.sh slow-mm
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]

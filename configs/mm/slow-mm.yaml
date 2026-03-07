@@ -1,0 +1,33 @@
+symbol: BTC
+dry_run: false
+
+# Timing
+interval_secs: 60
+
+# Spread / quoting
+spread_bps: 10
+order_size: 0.001
+order_levels: 3
+level_spacing_bps: 5
+ob_depth: 5
+
+# Inventory management
+max_inventory: 0.01
+skew_factor: 0.5
+inventory_hard_limit_mult: 2.0
+
+# Volatility-adaptive spread
+volatility_window: 60
+volatility_spread_mult: 1.0
+min_spread_bps: 3
+max_spread_bps: 50
+
+# Hedge (sub-account)
+hedge_enabled: true
+hedge_threshold_ratio: 0.6
+hedge_close_threshold_ratio: 0.3
+
+# Risk
+max_leverage: 20
+equity_usd_fallback: 500
+stale_order_secs: 300
