@@ -352,8 +352,17 @@ impl MmEngine {
             self.cfg.max_spread_bps,
         );
 
+        // Wait for WebSocket to warm up so cached open orders are populated
+        log::info!("[MM] Waiting for WebSocket to warm up...");
+        sleep(Duration::from_secs(5)).await;
+
         // Clean slate on startup: cancel all orders and close all positions
+        log::info!("[MM] Cancelling all main orders on startup...");
         self.cancel_all_main_orders().await;
+        // Retry once after a short wait in case WebSocket cache was still loading
+        sleep(Duration::from_secs(2)).await;
+        self.cancel_all_main_orders().await;
+
         log::info!("[MM] Closing all main positions on startup...");
         if let Err(e) = self
             .main_conn
@@ -381,9 +390,6 @@ impl MmEngine {
         self.inventory = 0.0;
         self.hedge_position = 0.0;
         self.realized_pnl = 0.0;
-
-        // Allow websocket to warm up
-        sleep(Duration::from_secs(3)).await;
 
         let mut ticker = tokio::time::interval(Duration::from_secs(self.cfg.interval_secs));
         loop {
