@@ -8,6 +8,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::{sleep, Duration};
 
 use crate::status_reporter::{PositionInfo, StatusReporter};
@@ -392,12 +393,53 @@ impl MmEngine {
         self.realized_pnl = 0.0;
 
         let mut ticker = tokio::time::interval(Duration::from_secs(self.cfg.interval_secs));
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
         loop {
-            ticker.tick().await;
-            if let Err(e) = self.step().await {
-                log::error!("[MM] step failed: {:?}", e);
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if let Err(e) = self.step().await {
+                        log::error!("[MM] step failed: {:?}", e);
+                    }
+                }
+                _ = sigterm.recv() => {
+                    log::info!("[MM] SIGTERM received, shutting down...");
+                    break;
+                }
             }
         }
+        self.shutdown().await;
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) {
+        log::info!("[MM] Cancelling all main orders...");
+        self.cancel_all_main_orders().await;
+        log::info!("[MM] Closing all main positions...");
+        if let Err(e) = self
+            .main_conn
+            .close_all_positions(Some(self.cfg.symbol.clone()))
+            .await
+        {
+            log::warn!("[MM] Failed to close main positions: {:?}", e);
+        }
+        if let Some(ref hedge) = self.hedge_conn {
+            log::info!("[MM] Cancelling hedge orders...");
+            if let Err(e) = hedge
+                .cancel_all_orders(Some(self.cfg.symbol.clone()))
+                .await
+            {
+                log::warn!("[MM] Failed to cancel hedge orders: {:?}", e);
+            }
+            log::info!("[MM] Closing hedge positions...");
+            if let Err(e) = hedge
+                .close_all_positions(Some(self.cfg.symbol.clone()))
+                .await
+            {
+                log::warn!("[MM] Failed to close hedge positions: {:?}", e);
+            }
+        }
+        log::info!("[MM] Shutdown complete.");
     }
 
     // -----------------------------------------------------------------------
