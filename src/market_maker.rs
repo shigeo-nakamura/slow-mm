@@ -18,8 +18,8 @@ use crate::trade::execution::dex_connector_box::DexConnectorBox;
 
 const DEFAULT_INTERVAL_SECS: u64 = 60;
 const DEFAULT_SPREAD_BPS: f64 = 10.0;
-const DEFAULT_ORDER_SIZE: f64 = 0.01;
-const DEFAULT_MAX_INVENTORY: f64 = 0.05;
+const DEFAULT_ORDER_SIZE_PCT: f64 = 0.02;
+const DEFAULT_MAX_INVENTORY_PCT: f64 = 0.10;
 const DEFAULT_SKEW_FACTOR: f64 = 0.5;
 const DEFAULT_MAX_LEVERAGE: u32 = 20;
 const DEFAULT_EQUITY_USD: f64 = 500.0;
@@ -46,8 +46,8 @@ struct MmYaml {
     dry_run: Option<bool>,
     interval_secs: Option<u64>,
     spread_bps: Option<f64>,
-    order_size: Option<f64>,
-    max_inventory: Option<f64>,
+    order_size_pct: Option<f64>,
+    max_inventory_pct: Option<f64>,
     skew_factor: Option<f64>,
     max_leverage: Option<u32>,
     equity_usd_fallback: Option<f64>,
@@ -76,10 +76,10 @@ pub struct MmConfig {
     pub interval_secs: u64,
     /// Base half-spread in bps (each side from mid)
     pub spread_bps: f64,
-    /// Size per order level (in token units, e.g. 0.01 BTC)
-    pub order_size: f64,
-    /// Max unhedged inventory (in token units)
-    pub max_inventory: f64,
+    /// Size per order level as fraction of equity (e.g. 0.02 = 2%)
+    pub order_size_pct: f64,
+    /// Max unhedged inventory as fraction of equity (e.g. 0.10 = 10%)
+    pub max_inventory_pct: f64,
     /// How much to skew quotes toward inventory-reducing side (0..1)
     pub skew_factor: f64,
     pub max_leverage: u32,
@@ -130,8 +130,8 @@ impl MmConfig {
             dry_run: yaml.dry_run.unwrap_or(true),
             interval_secs: yaml.interval_secs.unwrap_or(DEFAULT_INTERVAL_SECS),
             spread_bps: yaml.spread_bps.unwrap_or(DEFAULT_SPREAD_BPS),
-            order_size: yaml.order_size.unwrap_or(DEFAULT_ORDER_SIZE),
-            max_inventory: yaml.max_inventory.unwrap_or(DEFAULT_MAX_INVENTORY),
+            order_size_pct: yaml.order_size_pct.unwrap_or(DEFAULT_ORDER_SIZE_PCT),
+            max_inventory_pct: yaml.max_inventory_pct.unwrap_or(DEFAULT_MAX_INVENTORY_PCT),
             skew_factor: yaml.skew_factor.unwrap_or(DEFAULT_SKEW_FACTOR),
             max_leverage: yaml.max_leverage.unwrap_or(DEFAULT_MAX_LEVERAGE),
             equity_usd: yaml.equity_usd_fallback.unwrap_or(DEFAULT_EQUITY_USD),
@@ -169,8 +169,8 @@ impl MmConfig {
                 == "true",
             interval_secs: parse_env("INTERVAL_SECS", DEFAULT_INTERVAL_SECS),
             spread_bps: parse_env("SPREAD_BPS", DEFAULT_SPREAD_BPS),
-            order_size: parse_env("ORDER_SIZE", DEFAULT_ORDER_SIZE),
-            max_inventory: parse_env("MAX_INVENTORY", DEFAULT_MAX_INVENTORY),
+            order_size_pct: parse_env("ORDER_SIZE_PCT", DEFAULT_ORDER_SIZE_PCT),
+            max_inventory_pct: parse_env("MAX_INVENTORY_PCT", DEFAULT_MAX_INVENTORY_PCT),
             skew_factor: parse_env("SKEW_FACTOR", DEFAULT_SKEW_FACTOR),
             max_leverage: parse_env("MAX_LEVERAGE", DEFAULT_MAX_LEVERAGE),
             equity_usd: parse_env("EQUITY_USD_FALLBACK", DEFAULT_EQUITY_USD),
@@ -233,6 +233,9 @@ pub struct MmEngine {
     main_conn: Arc<dyn DexConnector + Send + Sync>,
     /// Hedge account connector (optional)
     hedge_conn: Option<Arc<dyn DexConnector + Send + Sync>>,
+    /// Cached account equity in USD
+    equity_cache: f64,
+    last_equity_fetch: Option<Instant>,
     /// Signed inventory: positive = long, negative = short (in token units)
     inventory: f64,
     /// Current hedge position size on hedge account (signed)
@@ -295,10 +298,13 @@ impl MmEngine {
             None
         };
 
+        let equity_fallback = cfg.equity_usd;
         Ok(Self {
             cfg,
             main_conn: Arc::new(main_conn),
             hedge_conn,
+            equity_cache: equity_fallback,
+            last_equity_fetch: None,
             inventory: 0.0,
             hedge_position: 0.0,
             mid_prices: Vec::new(),
@@ -320,10 +326,10 @@ impl MmEngine {
             self.cfg.dry_run
         );
         log::info!(
-            "[CONFIG] spread_bps={} order_size={} max_inventory={} order_levels={} skew_factor={}",
+            "[CONFIG] spread_bps={} order_size_pct={} max_inventory_pct={} order_levels={} skew_factor={}",
             self.cfg.spread_bps,
-            self.cfg.order_size,
-            self.cfg.max_inventory,
+            self.cfg.order_size_pct,
+            self.cfg.max_inventory_pct,
             self.cfg.order_levels,
             self.cfg.skew_factor,
         );
@@ -402,18 +408,26 @@ impl MmEngine {
         // 4. Process fills (check what got filled since last step)
         self.process_fills().await;
 
-        // 5. Compute dynamic spread based on volatility
+        // 5. Fetch equity for position sizing
+        self.refresh_equity().await;
+        let equity = self.equity_cache;
+
+        // 6. Compute dynamic order size and inventory limits from equity
+        let order_size_tokens = equity * self.cfg.order_size_pct / mid;
+        let max_inventory_tokens = equity * self.cfg.max_inventory_pct / mid;
+
+        // 7. Compute dynamic spread based on volatility
         let effective_spread_bps = self.compute_effective_spread();
 
-        // 6. Compute skew based on inventory
-        let skew_bps = self.compute_skew_bps();
+        // 8. Compute skew based on inventory
+        let skew_bps = self.compute_skew_bps(max_inventory_tokens);
 
         let half_spread_bps = effective_spread_bps / 2.0;
         let bid_offset_bps = half_spread_bps + skew_bps; // positive skew pushes bid down when long
         let ask_offset_bps = half_spread_bps - skew_bps; // positive skew pulls ask down when long
 
-        // 7. Determine if we should quote on each side
-        let hard_limit = self.cfg.max_inventory * self.cfg.inventory_hard_limit_mult;
+        // 9. Determine if we should quote on each side
+        let hard_limit = max_inventory_tokens * self.cfg.inventory_hard_limit_mult;
         let quote_bid = self.inventory < hard_limit;
         let quote_ask = self.inventory > -hard_limit;
 
@@ -435,7 +449,7 @@ impl MmEngine {
                 }
 
                 let bid_price_dec = self.round_price(bid_price);
-                let size_dec = self.round_size(self.cfg.order_size);
+                let size_dec = self.round_size(order_size_tokens);
 
                 if size_dec <= Decimal::ZERO || bid_price_dec <= Decimal::ZERO {
                     continue;
@@ -488,7 +502,7 @@ impl MmEngine {
                 }
 
                 let ask_price_dec = self.round_price(ask_price);
-                let size_dec = self.round_size(self.cfg.order_size);
+                let size_dec = self.round_size(order_size_tokens);
 
                 if size_dec <= Decimal::ZERO || ask_price_dec <= Decimal::ZERO {
                     continue;
@@ -535,14 +549,17 @@ impl MmEngine {
 
         // 9. Manage hedge position
         if self.cfg.hedge_enabled && self.hedge_conn.is_some() {
-            self.manage_hedge(mid).await;
+            self.manage_hedge(max_inventory_tokens, order_size_tokens).await;
         }
 
         // 10. Log status
         let unrealized_pnl = self.estimate_unrealized_pnl(mid);
         log::info!(
-            "[MM] mid={:.2} inv={:.6} hedge={:.6} net_exposure={:.6} spread_bps={:.1} skew_bps={:.1} pnl_realized={:.4} pnl_unrealized={:.4} trades={} bids_filled={} asks_filled={}",
+            "[MM] mid={:.2} equity={:.2} order_size={:.6} max_inv={:.6} inv={:.6} hedge={:.6} net_exposure={:.6} spread_bps={:.1} skew_bps={:.1} pnl_realized={:.4} pnl_unrealized={:.4} trades={} bids_filled={} asks_filled={}",
             mid,
+            equity,
+            order_size_tokens,
+            max_inventory_tokens,
             self.inventory,
             self.hedge_position,
             self.inventory + self.hedge_position,
@@ -562,6 +579,30 @@ impl MmEngine {
     // -----------------------------------------------------------------------
     // Inventory sync from exchange
     // -----------------------------------------------------------------------
+
+    async fn refresh_equity(&mut self) {
+        // Refresh equity at most every 5 minutes to avoid excessive API calls
+        let should_refresh = self
+            .last_equity_fetch
+            .map(|t| t.elapsed() > Duration::from_secs(300))
+            .unwrap_or(true);
+        if !should_refresh {
+            return;
+        }
+        match self.main_conn.get_balance(None).await {
+            Ok(bal) => {
+                let equity = bal.equity.to_f64().unwrap_or(0.0);
+                if equity > 0.0 {
+                    self.equity_cache = equity;
+                    self.last_equity_fetch = Some(Instant::now());
+                    log::debug!("[MM] Equity refreshed: {:.2}", equity);
+                }
+            }
+            Err(e) => {
+                log::warn!("[MM] Failed to get balance, using cached equity {:.2}: {:?}", self.equity_cache, e);
+            }
+        }
+    }
 
     async fn sync_inventory_from_exchange(&mut self) {
         match self.main_conn.get_positions().await {
@@ -677,12 +718,12 @@ impl MmEngine {
     // Inventory skew
     // -----------------------------------------------------------------------
 
-    fn compute_skew_bps(&self) -> f64 {
-        if self.cfg.max_inventory <= 0.0 {
+    fn compute_skew_bps(&self, max_inventory_tokens: f64) -> f64 {
+        if max_inventory_tokens <= 0.0 {
             return 0.0;
         }
         // Normalized inventory: -1 to +1
-        let inv_ratio = (self.inventory / self.cfg.max_inventory).clamp(-1.0, 1.0);
+        let inv_ratio = (self.inventory / max_inventory_tokens).clamp(-1.0, 1.0);
         // Skew in bps: positive when long (pushes bid down, ask down => easier to sell)
         inv_ratio * self.cfg.skew_factor * self.cfg.spread_bps
     }
@@ -691,15 +732,15 @@ impl MmEngine {
     // Hedge management
     // -----------------------------------------------------------------------
 
-    async fn manage_hedge(&mut self, _mid: f64) {
+    async fn manage_hedge(&mut self, max_inventory_tokens: f64, order_size_tokens: f64) {
         let hedge_conn = match &self.hedge_conn {
             Some(c) => c.clone(),
             None => return,
         };
 
         let abs_inv = self.inventory.abs();
-        let hedge_threshold = self.cfg.max_inventory * self.cfg.hedge_threshold_ratio;
-        let close_threshold = self.cfg.max_inventory * self.cfg.hedge_close_threshold_ratio;
+        let hedge_threshold = max_inventory_tokens * self.cfg.hedge_threshold_ratio;
+        let close_threshold = max_inventory_tokens * self.cfg.hedge_close_threshold_ratio;
 
         // Desired hedge = -inventory (delta neutral)
         // But only hedge when above threshold
@@ -714,7 +755,7 @@ impl MmEngine {
         };
 
         let hedge_delta = desired_hedge - self.hedge_position;
-        if hedge_delta.abs() < self.cfg.order_size * 0.5 {
+        if hedge_delta.abs() < order_size_tokens * 0.5 {
             return; // Delta too small to bother
         }
 
