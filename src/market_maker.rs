@@ -413,8 +413,9 @@ impl MmEngine {
         let equity = self.equity_cache;
 
         // 6. Compute dynamic order size and inventory limits from equity
-        let order_size_tokens = equity * self.cfg.order_size_pct / mid;
-        let max_inventory_tokens = equity * self.cfg.max_inventory_pct / mid;
+        let leverage = self.cfg.max_leverage as f64;
+        let order_size_tokens = equity * self.cfg.order_size_pct * leverage / mid;
+        let max_inventory_tokens = equity * self.cfg.max_inventory_pct * leverage / mid;
 
         // 7. Compute dynamic spread based on volatility
         let effective_spread_bps = self.compute_effective_spread();
