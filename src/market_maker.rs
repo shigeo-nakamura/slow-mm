@@ -884,6 +884,24 @@ impl MmEngine {
                 }
             }
         }
+        if let Some(ref hedge) = self.hedge_conn {
+            if let Ok(positions) = hedge.get_positions().await {
+                for p in &positions {
+                    if p.size > Decimal::ZERO {
+                        result.push(PositionInfo {
+                            symbol: format!("{}_HEDGE", p.symbol),
+                            side: if p.sign > 0 {
+                                "long".to_string()
+                            } else {
+                                "short".to_string()
+                            },
+                            size: p.size.to_string(),
+                            entry_price: p.entry_price.map(|ep| ep.to_string()),
+                        });
+                    }
+                }
+            }
+        }
         result
     }
 
