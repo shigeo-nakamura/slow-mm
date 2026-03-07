@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::{sleep, Duration};
 
+use crate::status_reporter::{PositionInfo, StatusReporter};
 use crate::trade::execution::dex_connector_box::DexConnectorBox;
 
 // ---------------------------------------------------------------------------
@@ -255,6 +256,8 @@ pub struct MmEngine {
     total_trades: u64,
     total_bid_fills: u64,
     total_ask_fills: u64,
+    /// Dashboard status reporter
+    status_reporter: Option<StatusReporter>,
 }
 
 impl MmEngine {
@@ -299,6 +302,7 @@ impl MmEngine {
         };
 
         let equity_fallback = cfg.equity_usd;
+        let status_reporter = StatusReporter::from_env(cfg.dry_run, cfg.interval_secs);
         Ok(Self {
             cfg,
             main_conn: Arc::new(main_conn),
@@ -316,6 +320,7 @@ impl MmEngine {
             total_trades: 0,
             total_bid_fills: 0,
             total_ask_fills: 0,
+            status_reporter,
         })
     }
 
@@ -597,6 +602,16 @@ impl MmEngine {
             self.total_ask_fills,
         );
 
+        // 11. Write dashboard status
+        if self.status_reporter.is_some() {
+            let positions = self.build_position_info().await;
+            let reporter = self.status_reporter.as_mut().unwrap();
+            reporter.update_equity(equity);
+            if let Err(err) = reporter.write_snapshot_if_due(&positions) {
+                log::warn!("[STATUS] failed to write status: {:?}", err);
+            }
+        }
+
         self.last_mid = Some(mid);
         Ok(())
     }
@@ -845,6 +860,31 @@ impl MmEngine {
         } else {
             0.0
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Status reporting
+    // -----------------------------------------------------------------------
+
+    async fn build_position_info(&self) -> Vec<PositionInfo> {
+        let mut result = Vec::new();
+        if let Ok(positions) = self.main_conn.get_positions().await {
+            for p in &positions {
+                if p.size > Decimal::ZERO {
+                    result.push(PositionInfo {
+                        symbol: p.symbol.clone(),
+                        side: if p.sign > 0 {
+                            "long".to_string()
+                        } else {
+                            "short".to_string()
+                        },
+                        size: p.size.to_string(),
+                        entry_price: p.entry_price.map(|ep| ep.to_string()),
+                    });
+                }
+            }
+        }
+        result
     }
 
     // -----------------------------------------------------------------------
