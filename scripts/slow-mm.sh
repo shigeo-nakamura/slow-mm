@@ -25,7 +25,9 @@ if [ ! -f "$ENV_FILE" ]; then
     exit 1
 fi
 
+set -a
 source "$ENV_FILE"
+set +a
 
 # Ensure lighter-go shared library is discoverable
 if [ -z "${LIGHTER_GO_PATH:-}" ] && [ -f "${BASE_DIR}/lib/libsigner.so" ]; then
