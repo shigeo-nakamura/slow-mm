@@ -542,7 +542,7 @@ impl MmEngine {
                         Some(bid_price_dec),
                         None,
                         false,
-                        None,
+                        Some(self.cfg.stale_order_secs),
                     )
                     .await
                 {
@@ -595,7 +595,7 @@ impl MmEngine {
                         Some(ask_price_dec),
                         None,
                         false,
-                        None,
+                        Some(self.cfg.stale_order_secs),
                     )
                     .await
                 {
