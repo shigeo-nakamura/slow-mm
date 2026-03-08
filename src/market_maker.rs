@@ -964,26 +964,35 @@ impl MmEngine {
                 Err(e) => log::error!("[HEDGE-STEP] Failed: {:?}", e),
             }
         } else if exposure_usd <= close_threshold_usd && self.hedge_position.abs() > 0.0 {
-            // Exposure back to normal — close hedge to free capital
-            let side = if self.hedge_position > 0.0 {
-                OrderSide::Short
+            // Only close hedge when main inventory has genuinely reduced.
+            // Check if inventory (main only) is small enough that the hedge is no longer needed.
+            let inv_usd = self.inventory.abs() * mid;
+            if inv_usd <= close_threshold_usd {
+                let side = if self.hedge_position > 0.0 {
+                    OrderSide::Short
+                } else {
+                    OrderSide::Long
+                };
+                let size = self.round_size(self.hedge_position.abs());
+                if size <= Decimal::ZERO {
+                    return;
+                }
+                log::info!(
+                    "[HEDGE-STEP] Closing hedge: inv_usd=${:.2} close_threshold=${:.2} side={:?} size={}",
+                    inv_usd, close_threshold_usd, side, size
+                );
+                match hedge_conn
+                    .create_order(&self.cfg.symbol, size, side, None, None, false, None)
+                    .await
+                {
+                    Ok(_) => log::info!("[HEDGE-STEP] Hedge closed: {:?} size={}", side, size),
+                    Err(e) => log::error!("[HEDGE-STEP] Failed to close hedge: {:?}", e),
+                }
             } else {
-                OrderSide::Long
-            };
-            let size = self.round_size(self.hedge_position.abs());
-            if size <= Decimal::ZERO {
-                return;
-            }
-            log::info!(
-                "[HEDGE-STEP] Closing hedge: exposure=${:.2} close_threshold=${:.2} side={:?} size={}",
-                exposure_usd, close_threshold_usd, side, size
-            );
-            match hedge_conn
-                .create_order(&self.cfg.symbol, size, side, None, None, false, None)
-                .await
-            {
-                Ok(_) => log::info!("[HEDGE-STEP] Hedge closed: {:?} size={}", side, size),
-                Err(e) => log::error!("[HEDGE-STEP] Failed to close hedge: {:?}", e),
+                log::debug!(
+                    "[HEDGE-STEP] Net exposure low but inventory=${:.2} still above close_threshold=${:.2}, keeping hedge",
+                    inv_usd, close_threshold_usd
+                );
             }
         }
     }
