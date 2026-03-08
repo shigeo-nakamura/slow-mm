@@ -235,8 +235,10 @@ pub struct MmEngine {
     main_conn: Arc<dyn DexConnector + Send + Sync>,
     /// Hedge account connector (optional)
     hedge_conn: Option<Arc<dyn DexConnector + Send + Sync>>,
-    /// Cached account equity in USD
+    /// Cached account equity in USD (main only, used for position sizing)
     equity_cache: f64,
+    /// Cached hedge account equity in USD
+    hedge_equity_cache: f64,
     last_equity_fetch: Option<Instant>,
     /// Signed inventory: positive = long, negative = short (in token units)
     inventory: f64,
@@ -309,6 +311,7 @@ impl MmEngine {
             main_conn: Arc::new(main_conn),
             hedge_conn,
             equity_cache: equity_fallback,
+            hedge_equity_cache: 0.0,
             last_equity_fetch: None,
             inventory: 0.0,
             hedge_position: 0.0,
@@ -635,20 +638,19 @@ impl MmEngine {
         }
 
         // 10. Log status
-        let unrealized_pnl = self.estimate_unrealized_pnl(mid);
+        let total_equity = equity + self.hedge_equity_cache;
         log::info!(
-            "[MM] mid={:.2} equity={:.2} order_size={:.6} max_inv={:.6} inv={:.6} hedge={:.6} net_exposure={:.6} spread_bps={:.1} skew_bps={:.1} pnl_realized={:.4} pnl_unrealized={:.4} trades={} bids_filled={} asks_filled={}",
+            "[MM] mid={:.2} equity={:.2} hedge_equity={:.2} total_equity={:.2} inv={:.6} hedge={:.6} net_exposure={:.6} spread_bps={:.1} skew_bps={:.1} pnl_realized={:.4} trades={} bids_filled={} asks_filled={}",
             mid,
             equity,
-            order_size_tokens,
-            max_inventory_tokens,
+            self.hedge_equity_cache,
+            total_equity,
             self.inventory,
             self.hedge_position,
             self.inventory + self.hedge_position,
             effective_spread_bps,
             skew_bps,
             self.realized_pnl,
-            unrealized_pnl,
             self.total_trades,
             self.total_bid_fills,
             self.total_ask_fills,
@@ -658,7 +660,7 @@ impl MmEngine {
         if self.status_reporter.is_some() {
             let positions = self.build_position_info().await;
             let reporter = self.status_reporter.as_mut().unwrap();
-            reporter.update_equity(equity);
+            reporter.update_equity(total_equity);
             if let Err(err) = reporter.write_snapshot_if_due(&positions) {
                 log::warn!("[STATUS] failed to write status: {:?}", err);
             }
@@ -687,11 +689,26 @@ impl MmEngine {
                 if equity > 0.0 {
                     self.equity_cache = equity;
                     self.last_equity_fetch = Some(Instant::now());
-                    log::debug!("[MM] Equity refreshed: {:.2}", equity);
+                    log::debug!("[MM] Main equity refreshed: {:.2}", equity);
                 }
             }
             Err(e) => {
                 log::warn!("[MM] Failed to get balance, using cached equity {:.2}: {:?}", self.equity_cache, e);
+            }
+        }
+        // Also refresh hedge equity
+        if let Some(ref hedge) = self.hedge_conn {
+            match hedge.get_balance(None).await {
+                Ok(bal) => {
+                    let equity = bal.equity.to_f64().unwrap_or(0.0);
+                    if equity > 0.0 {
+                        self.hedge_equity_cache = equity;
+                        log::debug!("[MM] Hedge equity refreshed: {:.2}", equity);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("[MM] Failed to get hedge balance: {:?}", e);
+                }
             }
         }
     }
@@ -1014,21 +1031,6 @@ impl MmEngine {
         }
         self.active_bid_ids.clear();
         self.active_ask_ids.clear();
-    }
-
-    // -----------------------------------------------------------------------
-    // PnL estimation
-    // -----------------------------------------------------------------------
-
-    fn estimate_unrealized_pnl(&self, mid: f64) -> f64 {
-        // Unrealized PnL from main inventory at current mid
-        // This is a rough estimate; actual PnL depends on entry prices
-        let net_exposure = self.inventory + self.hedge_position;
-        if let Some(last_mid) = self.last_mid {
-            net_exposure * (mid - last_mid)
-        } else {
-            0.0
-        }
     }
 
     // -----------------------------------------------------------------------
