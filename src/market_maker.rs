@@ -393,6 +393,7 @@ impl MmEngine {
         self.realized_pnl = 0.0;
 
         let mut ticker = tokio::time::interval(Duration::from_secs(self.cfg.interval_secs));
+        let mut fill_checker = tokio::time::interval(Duration::from_secs(2));
         let mut sigterm =
             signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
         loop {
@@ -401,6 +402,9 @@ impl MmEngine {
                     if let Err(e) = self.step().await {
                         log::error!("[MM] step failed: {:?}", e);
                     }
+                }
+                _ = fill_checker.tick() => {
+                    self.check_fills_and_hedge().await;
                 }
                 _ = sigterm.recv() => {
                     log::info!("[MM] SIGTERM received, shutting down...");
@@ -875,6 +879,96 @@ impl MmEngine {
             }
             Err(e) => {
                 log::error!("[HEDGE] Failed to place hedge order: {:?}", e);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Real-time fill detection → instant hedge
+    // -----------------------------------------------------------------------
+
+    /// Called every 2s to detect new fills and hedge immediately.
+    /// This avoids waiting for the full 60s step cycle.
+    async fn check_fills_and_hedge(&mut self) {
+        if !self.cfg.hedge_enabled || self.hedge_conn.is_none() {
+            return;
+        }
+
+        // Check for new fills via WebSocket cache
+        let fills = match self.main_conn.get_filled_orders(&self.cfg.symbol).await {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+
+        if fills.orders.is_empty() {
+            return;
+        }
+
+        // Process fills and update inventory
+        let mut fill_delta = 0.0_f64; // signed: positive = bought, negative = sold
+        for fill in &fills.orders {
+            let size = fill.filled_size.and_then(|s| s.to_f64()).unwrap_or(0.0);
+            if size <= 0.0 {
+                continue;
+            }
+            match fill.filled_side {
+                Some(OrderSide::Long) => {
+                    fill_delta += size;
+                    self.total_bid_fills += 1;
+                    log::info!("[FILL-RT] LONG size={:.6}", size);
+                }
+                _ => {
+                    fill_delta -= size;
+                    self.total_ask_fills += 1;
+                    log::info!("[FILL-RT] SHORT size={:.6}", size);
+                }
+            }
+            self.total_trades += 1;
+            let _ = self
+                .main_conn
+                .clear_filled_order(&self.cfg.symbol, &fill.trade_id)
+                .await;
+        }
+
+        if fill_delta.abs() < 1e-10 {
+            return;
+        }
+
+        // Update inventory from exchange position for accuracy
+        self.sync_inventory_from_exchange().await;
+
+        // Immediate hedge: place market order on hedge account for the fill delta
+        let hedge_conn = self.hedge_conn.as_ref().unwrap().clone();
+        let hedge_side = if fill_delta > 0.0 {
+            // We bought on main → sell on hedge
+            OrderSide::Short
+        } else {
+            // We sold on main → buy on hedge
+            OrderSide::Long
+        };
+        let hedge_size = self.round_size(fill_delta.abs());
+        if hedge_size <= Decimal::ZERO {
+            return;
+        }
+
+        log::info!(
+            "[HEDGE-RT] Instant hedge: fill_delta={:.6} side={:?} size={}",
+            fill_delta,
+            hedge_side,
+            hedge_size
+        );
+
+        match hedge_conn
+            .create_order(&self.cfg.symbol, hedge_size, hedge_side, None, None, false, None)
+            .await
+        {
+            Ok(_) => {
+                log::info!("[HEDGE-RT] Instant hedge placed: {:?} size={}", hedge_side, hedge_size);
+                // Sync hedge position
+                self.sync_inventory_from_exchange().await;
+            }
+            Err(e) => {
+                log::error!("[HEDGE-RT] Failed to place instant hedge: {:?}", e);
             }
         }
     }
