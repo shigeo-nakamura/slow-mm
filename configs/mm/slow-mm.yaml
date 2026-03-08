@@ -24,8 +24,8 @@ max_spread_bps: 50
 
 # Hedge (sub-account)
 hedge_enabled: true
-hedge_threshold_ratio: 0.6
-hedge_close_threshold_ratio: 0.3
+hedge_threshold_ratio: 0.2
+hedge_close_threshold_ratio: 0.1
 
 # Risk
 max_leverage: 20
