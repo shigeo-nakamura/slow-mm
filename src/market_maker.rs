@@ -761,11 +761,14 @@ impl MmEngine {
             Ok(fills) => {
                 for fill in &fills.orders {
                     let size = fill.filled_size.and_then(|s| s.to_f64()).unwrap_or(0.0);
-                    let fill_price = fill.filled_value.and_then(|v| v.to_f64()).unwrap_or(0.0);
+                    let fill_value = fill.filled_value.and_then(|v| v.to_f64()).unwrap_or(0.0);
 
                     if size <= 0.0 {
                         continue;
                     }
+
+                    // filled_value = size * price, so derive fill_price
+                    let fill_price = if fill_value > 0.0 { fill_value / size } else { 0.0 };
 
                     // Realized PnL from spread capture
                     if let Some(mid) = self.last_mid {
@@ -936,10 +939,12 @@ impl MmEngine {
         let mut fill_delta = 0.0_f64; // signed: positive = bought, negative = sold
         for fill in &fills.orders {
             let size = fill.filled_size.and_then(|s| s.to_f64()).unwrap_or(0.0);
-            let fill_price = fill.filled_value.and_then(|v| v.to_f64()).unwrap_or(0.0);
+            let fill_value = fill.filled_value.and_then(|v| v.to_f64()).unwrap_or(0.0);
             if size <= 0.0 {
                 continue;
             }
+            // filled_value = size * price, so derive fill_price
+            let fill_price = if fill_value > 0.0 { fill_value / size } else { 0.0 };
             // Realized PnL: spread captured = (fill_price - mid) * size for sells,
             //                                  (mid - fill_price) * size for buys
             // This measures profit from providing liquidity above/below mid.
