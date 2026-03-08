@@ -744,21 +744,32 @@ impl MmEngine {
             Ok(fills) => {
                 for fill in &fills.orders {
                     let size = fill.filled_size.and_then(|s| s.to_f64()).unwrap_or(0.0);
-                    let value = fill.filled_value.and_then(|v| v.to_f64()).unwrap_or(0.0);
+                    let fill_price = fill.filled_value.and_then(|v| v.to_f64()).unwrap_or(0.0);
 
                     if size <= 0.0 {
                         continue;
+                    }
+
+                    // Realized PnL from spread capture
+                    if let Some(mid) = self.last_mid {
+                        if fill_price > 0.0 {
+                            let pnl = match fill.filled_side {
+                                Some(OrderSide::Long) => (mid - fill_price) * size,
+                                _ => (fill_price - mid) * size,
+                            };
+                            self.realized_pnl += pnl;
+                        }
                     }
 
                     self.total_trades += 1;
                     match fill.filled_side {
                         Some(OrderSide::Long) => {
                             self.total_bid_fills += 1;
-                            log::info!("[FILL] LONG size={:.6} value={:.2}", size, value);
+                            log::info!("[FILL] LONG size={:.6} price={:.2}", size, fill_price);
                         }
                         _ => {
                             self.total_ask_fills += 1;
-                            log::info!("[FILL] SHORT size={:.6} value={:.2}", size, value);
+                            log::info!("[FILL] SHORT size={:.6} price={:.2}", size, fill_price);
                         }
                     }
 
@@ -908,19 +919,32 @@ impl MmEngine {
         let mut fill_delta = 0.0_f64; // signed: positive = bought, negative = sold
         for fill in &fills.orders {
             let size = fill.filled_size.and_then(|s| s.to_f64()).unwrap_or(0.0);
+            let fill_price = fill.filled_value.and_then(|v| v.to_f64()).unwrap_or(0.0);
             if size <= 0.0 {
                 continue;
+            }
+            // Realized PnL: spread captured = (fill_price - mid) * size for sells,
+            //                                  (mid - fill_price) * size for buys
+            // This measures profit from providing liquidity above/below mid.
+            if let Some(mid) = self.last_mid {
+                if fill_price > 0.0 {
+                    let pnl = match fill.filled_side {
+                        Some(OrderSide::Long) => (mid - fill_price) * size,
+                        _ => (fill_price - mid) * size,
+                    };
+                    self.realized_pnl += pnl;
+                }
             }
             match fill.filled_side {
                 Some(OrderSide::Long) => {
                     fill_delta += size;
                     self.total_bid_fills += 1;
-                    log::info!("[FILL-RT] LONG size={:.6}", size);
+                    log::info!("[FILL-RT] LONG size={:.6} price={:.2}", size, fill_price);
                 }
                 _ => {
                     fill_delta -= size;
                     self.total_ask_fills += 1;
-                    log::info!("[FILL-RT] SHORT size={:.6}", size);
+                    log::info!("[FILL-RT] SHORT size={:.6} price={:.2}", size, fill_price);
                 }
             }
             self.total_trades += 1;
@@ -937,23 +961,26 @@ impl MmEngine {
         // Update inventory from exchange position for accuracy
         self.sync_inventory_from_exchange().await;
 
-        // Immediate hedge: place market order on hedge account for the fill delta
+        // Hedge based on actual net_exposure (not fill_delta) to prevent rounding drift.
+        // net_exposure = inventory + hedge_position; we want it to be 0.
+        let net_exposure = self.inventory + self.hedge_position;
         let hedge_conn = self.hedge_conn.as_ref().unwrap().clone();
-        let hedge_side = if fill_delta > 0.0 {
-            // We bought on main → sell on hedge
+        let hedge_side = if net_exposure > 0.0 {
+            // Net long → sell on hedge to flatten
             OrderSide::Short
         } else {
-            // We sold on main → buy on hedge
+            // Net short → buy on hedge to flatten
             OrderSide::Long
         };
-        let hedge_size = self.round_size(fill_delta.abs());
+        let hedge_size = self.round_size(net_exposure.abs());
         if hedge_size <= Decimal::ZERO {
             return;
         }
 
         log::info!(
-            "[HEDGE-RT] Instant hedge: fill_delta={:.6} side={:?} size={}",
+            "[HEDGE-RT] Instant hedge: fill_delta={:.6} net_exposure={:.6} side={:?} size={}",
             fill_delta,
+            net_exposure,
             hedge_side,
             hedge_size
         );
