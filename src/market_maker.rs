@@ -916,50 +916,36 @@ impl MmEngine {
     // Hedge management
     // -----------------------------------------------------------------------
 
-    async fn manage_hedge(&mut self, max_inventory_tokens: f64, order_size_tokens: f64) {
+    /// Safety-net hedge correction on each step cycle.
+    /// Instant hedge (check_fills_and_hedge) handles real-time hedging.
+    /// This only corrects residual net_exposure drift from rounding or missed fills.
+    async fn manage_hedge(&mut self, _max_inventory_tokens: f64, order_size_tokens: f64) {
         let hedge_conn = match &self.hedge_conn {
             Some(c) => c.clone(),
             None => return,
         };
 
-        let abs_inv = self.inventory.abs();
-        let hedge_threshold = max_inventory_tokens * self.cfg.hedge_threshold_ratio;
-        let close_threshold = max_inventory_tokens * self.cfg.hedge_close_threshold_ratio;
-
-        // Desired hedge = -inventory (delta neutral)
-        // But only hedge when above threshold
-        let desired_hedge = if abs_inv >= hedge_threshold {
-            -self.inventory
-        } else if abs_inv <= close_threshold && self.hedge_position.abs() > 0.0 {
-            // Inventory has decreased — close the hedge
-            0.0
-        } else {
-            // In between — keep existing hedge
+        // Only correct if net_exposure has drifted beyond half an order size
+        let net_exposure = self.inventory + self.hedge_position;
+        if net_exposure.abs() < order_size_tokens * 0.5 {
             return;
-        };
-
-        let hedge_delta = desired_hedge - self.hedge_position;
-        if hedge_delta.abs() < order_size_tokens * 0.5 {
-            return; // Delta too small to bother
         }
 
-        let side = if hedge_delta > 0.0 {
-            OrderSide::Long
-        } else {
+        let side = if net_exposure > 0.0 {
             OrderSide::Short
+        } else {
+            OrderSide::Long
         };
-        let size = self.round_size(hedge_delta.abs());
+        let size = self.round_size(net_exposure.abs());
         if size <= Decimal::ZERO {
             return;
         }
 
-        // Use market order (no price) for hedge to ensure fill
         log::info!(
-            "[HEDGE] Adjusting: current={:.6} desired={:.6} delta={:.6} side={:?}",
-            self.hedge_position,
-            desired_hedge,
-            hedge_delta,
-            side
+            "[HEDGE-CORRECT] net_exposure={:.6} side={:?} size={}",
+            net_exposure,
+            side,
+            size
         );
 
         match hedge_conn
@@ -967,10 +953,10 @@ impl MmEngine {
             .await
         {
             Ok(_resp) => {
-                log::info!("[HEDGE] Order placed: {:?} size={} (market)", side, size);
+                log::info!("[HEDGE-CORRECT] Correction placed: {:?} size={}", side, size);
             }
             Err(e) => {
-                log::error!("[HEDGE] Failed to place hedge order: {:?}", e);
+                log::error!("[HEDGE-CORRECT] Failed: {:?}", e);
             }
         }
     }
