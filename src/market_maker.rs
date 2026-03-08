@@ -92,9 +92,9 @@ pub struct MmConfig {
     pub level_spacing_bps: f64,
     /// Whether to use a hedge account
     pub hedge_enabled: bool,
-    /// Hedge when inventory exceeds max_inventory * this ratio
+    /// Hedge when net exposure (USD) exceeds equity * this ratio
     pub hedge_threshold_ratio: f64,
-    /// Close hedge when inventory drops below max_inventory * this ratio
+    /// Close hedge when net exposure (USD) drops below equity * this ratio
     pub hedge_close_threshold_ratio: f64,
     /// Hard inventory limit = max_inventory * this mult; stop quoting on that side
     pub inventory_hard_limit_mult: f64,
@@ -921,33 +921,40 @@ impl MmEngine {
     // -----------------------------------------------------------------------
 
     /// Safety-net hedge on each step cycle.
-    /// Same threshold logic as instant hedge — only hedge excess beyond threshold.
-    /// Also handles closing hedge when inventory has decreased below close_threshold.
-    async fn manage_hedge(&mut self, max_inventory_tokens: f64, _order_size_tokens: f64) {
+    /// Same threshold logic as instant hedge — equity-normalized USD exposure.
+    /// Also handles closing hedge when exposure returns below close_threshold.
+    async fn manage_hedge(&mut self, _max_inventory_tokens: f64, _order_size_tokens: f64) {
         let hedge_conn = match &self.hedge_conn {
             Some(c) => c.clone(),
             None => return,
         };
 
         let net_exposure = self.inventory + self.hedge_position;
-        let hedge_threshold = max_inventory_tokens * self.cfg.hedge_threshold_ratio;
-        let close_threshold = max_inventory_tokens * self.cfg.hedge_close_threshold_ratio;
+        let mid = self.last_mid.unwrap_or(0.0);
+        if mid <= 0.0 {
+            return;
+        }
+        let exposure_usd = net_exposure.abs() * mid;
+        let equity = self.equity_cache + self.hedge_equity_cache;
+        let hedge_threshold_usd = equity * self.cfg.hedge_threshold_ratio;
+        let close_threshold_usd = equity * self.cfg.hedge_close_threshold_ratio;
 
-        if net_exposure.abs() > hedge_threshold {
+        if exposure_usd > hedge_threshold_usd {
             // Hedge excess beyond threshold
-            let excess = net_exposure.abs() - hedge_threshold;
+            let excess_usd = exposure_usd - hedge_threshold_usd;
+            let excess_tokens = excess_usd / mid;
             let side = if net_exposure > 0.0 {
                 OrderSide::Short
             } else {
                 OrderSide::Long
             };
-            let size = self.round_size(excess);
+            let size = self.round_size(excess_tokens);
             if size <= Decimal::ZERO {
                 return;
             }
             log::info!(
-                "[HEDGE-STEP] net_exposure={:.6} threshold={:.6} excess={:.6} side={:?} size={}",
-                net_exposure, hedge_threshold, excess, side, size
+                "[HEDGE-STEP] exposure=${:.2} threshold=${:.2} excess=${:.2} side={:?} size={}",
+                exposure_usd, hedge_threshold_usd, excess_usd, side, size
             );
             match hedge_conn
                 .create_order(&self.cfg.symbol, size, side, None, None, false, None)
@@ -956,8 +963,8 @@ impl MmEngine {
                 Ok(_) => log::info!("[HEDGE-STEP] Placed: {:?} size={}", side, size),
                 Err(e) => log::error!("[HEDGE-STEP] Failed: {:?}", e),
             }
-        } else if net_exposure.abs() <= close_threshold && self.hedge_position.abs() > 0.0 {
-            // Inventory back to normal — close hedge to free capital
+        } else if exposure_usd <= close_threshold_usd && self.hedge_position.abs() > 0.0 {
+            // Exposure back to normal — close hedge to free capital
             let side = if self.hedge_position > 0.0 {
                 OrderSide::Short
             } else {
@@ -968,8 +975,8 @@ impl MmEngine {
                 return;
             }
             log::info!(
-                "[HEDGE-STEP] Closing hedge: net_exposure={:.6} close_threshold={:.6} side={:?} size={}",
-                net_exposure, close_threshold, side, size
+                "[HEDGE-STEP] Closing hedge: exposure=${:.2} close_threshold=${:.2} side={:?} size={}",
+                exposure_usd, close_threshold_usd, side, size
             );
             match hedge_conn
                 .create_order(&self.cfg.symbol, size, side, None, None, false, None)
@@ -1050,39 +1057,47 @@ impl MmEngine {
         // Update inventory from exchange position for accuracy
         self.sync_inventory_from_exchange().await;
 
-        // Only hedge if net_exposure exceeds the threshold.
+        // Only hedge if net_exposure (in USD) exceeds equity * hedge_threshold_ratio.
         // Below threshold, inventory skew handles rebalancing naturally,
         // preserving spread revenue. Hedge is insurance for large moves only.
         let net_exposure = self.inventory + self.hedge_position;
-        let hedge_threshold = self.cached_max_inv * self.cfg.hedge_threshold_ratio;
+        let mid = self.last_mid.unwrap_or(0.0);
+        if mid <= 0.0 {
+            return;
+        }
+        let exposure_usd = net_exposure.abs() * mid;
+        let equity = self.equity_cache + self.hedge_equity_cache;
+        let hedge_threshold_usd = equity * self.cfg.hedge_threshold_ratio;
 
-        if net_exposure.abs() <= hedge_threshold {
+        if exposure_usd <= hedge_threshold_usd {
             log::debug!(
-                "[HEDGE-RT] net_exposure={:.6} within threshold={:.6}, skipping",
-                net_exposure,
-                hedge_threshold
+                "[HEDGE-RT] exposure=${:.2} within threshold=${:.2} ({:.0}% of equity), skipping",
+                exposure_usd,
+                hedge_threshold_usd,
+                self.cfg.hedge_threshold_ratio * 100.0
             );
             return;
         }
 
         // Hedge only the excess beyond threshold, keeping some inventory for spread revenue
-        let excess = net_exposure.abs() - hedge_threshold;
+        let excess_usd = exposure_usd - hedge_threshold_usd;
+        let excess_tokens = excess_usd / mid;
         let hedge_conn = self.hedge_conn.as_ref().unwrap().clone();
         let hedge_side = if net_exposure > 0.0 {
             OrderSide::Short
         } else {
             OrderSide::Long
         };
-        let hedge_size = self.round_size(excess);
+        let hedge_size = self.round_size(excess_tokens);
         if hedge_size <= Decimal::ZERO {
             return;
         }
 
         log::info!(
-            "[HEDGE-RT] Instant hedge: net_exposure={:.6} threshold={:.6} excess={:.6} side={:?} size={}",
-            net_exposure,
-            hedge_threshold,
-            excess,
+            "[HEDGE-RT] Instant hedge: exposure=${:.2} threshold=${:.2} excess=${:.2} side={:?} size={}",
+            exposure_usd,
+            hedge_threshold_usd,
+            excess_usd,
             hedge_side,
             hedge_size
         );
