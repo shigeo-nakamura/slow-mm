@@ -255,6 +255,8 @@ pub struct MmEngine {
     realized_pnl: f64,
     /// Last mid price used for PnL tracking
     last_mid: Option<f64>,
+    /// Whether we are in maintenance wind-down mode
+    in_maintenance_wind_down: bool,
     /// Running stats
     total_trades: u64,
     total_bid_fills: u64,
@@ -321,6 +323,7 @@ impl MmEngine {
             last_order_time: None,
             realized_pnl: 0.0,
             last_mid: None,
+            in_maintenance_wind_down: false,
             total_trades: 0,
             total_bid_fills: 0,
             total_ask_fills: 0,
@@ -450,10 +453,68 @@ impl MmEngine {
     }
 
     // -----------------------------------------------------------------------
+    // Maintenance wind-down
+    // -----------------------------------------------------------------------
+
+    async fn check_maintenance(&mut self) -> bool {
+        // Check if maintenance is coming within 1 hour
+        let upcoming = self.main_conn.is_upcoming_maintenance(1).await;
+
+        if upcoming && !self.in_maintenance_wind_down {
+            // Entering wind-down: cancel all orders and close all positions
+            log::warn!("[MM] Maintenance detected within 1 hour — entering wind-down mode");
+            self.in_maintenance_wind_down = true;
+
+            // Cancel all main orders
+            self.cancel_all_main_orders().await;
+
+            // Close main positions
+            if let Err(e) = self
+                .main_conn
+                .close_all_positions(Some(self.cfg.symbol.clone()))
+                .await
+            {
+                log::warn!("[MM] Failed to close main positions for maintenance: {:?}", e);
+            }
+
+            // Close hedge positions
+            if let Some(ref hedge) = self.hedge_conn {
+                if let Err(e) = hedge
+                    .cancel_all_orders(Some(self.cfg.symbol.clone()))
+                    .await
+                {
+                    log::warn!("[MM] Failed to cancel hedge orders for maintenance: {:?}", e);
+                }
+                if let Err(e) = hedge
+                    .close_all_positions(Some(self.cfg.symbol.clone()))
+                    .await
+                {
+                    log::warn!("[MM] Failed to close hedge positions for maintenance: {:?}", e);
+                }
+            }
+
+            self.inventory = 0.0;
+            self.hedge_position = 0.0;
+            log::info!("[MM] Wind-down complete — waiting for maintenance to end");
+        } else if !upcoming && self.in_maintenance_wind_down {
+            log::info!("[MM] Maintenance window ended — resuming trading");
+            self.in_maintenance_wind_down = false;
+        }
+
+        self.in_maintenance_wind_down
+    }
+
+    // -----------------------------------------------------------------------
     // Main loop step
     // -----------------------------------------------------------------------
 
     async fn step(&mut self) -> Result<()> {
+        // 0. Check maintenance schedule
+        if self.check_maintenance().await {
+            log::debug!("[MM] In maintenance wind-down, skipping step");
+            return Ok(());
+        }
+
         // 1. Get order book to determine mid price
         let ob = self
             .main_conn
@@ -921,7 +982,7 @@ impl MmEngine {
     /// Called every 2s to detect new fills and hedge immediately.
     /// This avoids waiting for the full 60s step cycle.
     async fn check_fills_and_hedge(&mut self) {
-        if !self.cfg.hedge_enabled || self.hedge_conn.is_none() {
+        if !self.cfg.hedge_enabled || self.hedge_conn.is_none() || self.in_maintenance_wind_down {
             return;
         }
 
