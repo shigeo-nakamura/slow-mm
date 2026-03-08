@@ -15,6 +15,8 @@ ob_depth: 5
 max_inventory_pct: 0.10    # 10% of equity as max unhedged inventory
 skew_factor: 1.5
 inventory_hard_limit_mult: 2.0
+force_close_mult: 1.5          # market-order close when inv > hard_limit * 1.5
+force_close_cooldown_secs: 120 # min seconds between force-close actions
 
 # Volatility-adaptive spread
 volatility_window: 60

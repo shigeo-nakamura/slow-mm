@@ -36,6 +36,8 @@ const DEFAULT_VOLATILITY_SPREAD_MULT: f64 = 1.0;
 const DEFAULT_MIN_SPREAD_BPS: f64 = 3.0;
 const DEFAULT_MAX_SPREAD_BPS: f64 = 50.0;
 const DEFAULT_OB_DEPTH: usize = 5;
+const DEFAULT_FORCE_CLOSE_MULT: f64 = 1.5;
+const DEFAULT_FORCE_CLOSE_COOLDOWN_SECS: u64 = 120;
 
 // ---------------------------------------------------------------------------
 // YAML config
@@ -59,6 +61,8 @@ struct MmYaml {
     hedge_threshold_ratio: Option<f64>,
     hedge_close_threshold_ratio: Option<f64>,
     inventory_hard_limit_mult: Option<f64>,
+    force_close_mult: Option<f64>,
+    force_close_cooldown_secs: Option<u64>,
     stale_order_secs: Option<u64>,
     volatility_window: Option<usize>,
     volatility_spread_mult: Option<f64>,
@@ -98,6 +102,10 @@ pub struct MmConfig {
     pub hedge_close_threshold_ratio: f64,
     /// Hard inventory limit = max_inventory * this mult; stop quoting on that side
     pub inventory_hard_limit_mult: f64,
+    /// Force close when inventory exceeds hard_limit * this mult (market order)
+    pub force_close_mult: f64,
+    /// Cooldown between force-close actions (seconds)
+    pub force_close_cooldown_secs: u64,
     /// Cancel and re-place orders after this many seconds even if mid hasn't moved
     pub stale_order_secs: u64,
     /// Number of mid-price samples for volatility estimation
@@ -149,6 +157,10 @@ impl MmConfig {
             inventory_hard_limit_mult: yaml
                 .inventory_hard_limit_mult
                 .unwrap_or(DEFAULT_INVENTORY_HARD_LIMIT_MULT),
+            force_close_mult: yaml.force_close_mult.unwrap_or(DEFAULT_FORCE_CLOSE_MULT),
+            force_close_cooldown_secs: yaml
+                .force_close_cooldown_secs
+                .unwrap_or(DEFAULT_FORCE_CLOSE_COOLDOWN_SECS),
             stale_order_secs: yaml.stale_order_secs.unwrap_or(DEFAULT_STALE_ORDER_SECS),
             volatility_window: yaml.volatility_window.unwrap_or(DEFAULT_VOLATILITY_WINDOW),
             volatility_spread_mult: yaml
@@ -193,6 +205,11 @@ impl MmConfig {
             inventory_hard_limit_mult: parse_env(
                 "INVENTORY_HARD_LIMIT_MULT",
                 DEFAULT_INVENTORY_HARD_LIMIT_MULT,
+            ),
+            force_close_mult: parse_env("FORCE_CLOSE_MULT", DEFAULT_FORCE_CLOSE_MULT),
+            force_close_cooldown_secs: parse_env(
+                "FORCE_CLOSE_COOLDOWN_SECS",
+                DEFAULT_FORCE_CLOSE_COOLDOWN_SECS,
             ),
             stale_order_secs: parse_env("STALE_ORDER_SECS", DEFAULT_STALE_ORDER_SECS),
             volatility_window: parse_env("VOLATILITY_WINDOW", DEFAULT_VOLATILITY_WINDOW),
@@ -259,6 +276,8 @@ pub struct MmEngine {
     cached_max_inv: f64,
     /// Whether we are in maintenance wind-down mode
     in_maintenance_wind_down: bool,
+    /// Last time force-close was triggered (cooldown)
+    last_force_close: Option<Instant>,
     /// Running stats
     total_trades: u64,
     total_bid_fills: u64,
@@ -327,6 +346,7 @@ impl MmEngine {
             last_mid: None,
             cached_max_inv: 0.0,
             in_maintenance_wind_down: false,
+            last_force_close: None,
             total_trades: 0,
             total_bid_fills: 0,
             total_ask_fills: 0,
@@ -581,7 +601,43 @@ impl MmEngine {
         let quote_bid = self.inventory < hard_limit;
         let quote_ask = self.inventory > -hard_limit;
 
-        // 8. Cancel existing orders and place new ones
+        // 8a. Force-close if inventory exceeds hard_limit * force_close_mult
+        let force_close_limit = hard_limit * self.cfg.force_close_mult;
+        let cooldown_ok = self
+            .last_force_close
+            .map(|t| t.elapsed().as_secs() >= self.cfg.force_close_cooldown_secs)
+            .unwrap_or(true);
+        if self.inventory.abs() > force_close_limit && cooldown_ok {
+            let excess = self.inventory.abs() - hard_limit;
+            let side = if self.inventory > 0.0 {
+                OrderSide::Short
+            } else {
+                OrderSide::Long
+            };
+            let size = self.round_size(excess);
+            if size > Decimal::ZERO {
+                log::warn!(
+                    "[MM] FORCE CLOSE: inv={:.6} exceeds force_limit={:.6}, closing excess={:.6} side={:?}",
+                    self.inventory, force_close_limit, excess, side
+                );
+                match self
+                    .main_conn
+                    .create_order(&self.cfg.symbol, size, side, None, None, false, None)
+                    .await
+                {
+                    Ok(_) => {
+                        log::warn!("[MM] FORCE CLOSE placed: {:?} size={}", side, size);
+                        self.last_force_close = Some(Instant::now());
+                        // Re-sync inventory after force close
+                        sleep(Duration::from_secs(2)).await;
+                        self.sync_inventory_from_exchange().await;
+                    }
+                    Err(e) => log::error!("[MM] FORCE CLOSE failed: {:?}", e),
+                }
+            }
+        }
+
+        // 8b. Cancel existing orders and place new ones
         self.cancel_all_main_orders().await;
 
         let mut new_bid_ids = Vec::new();
