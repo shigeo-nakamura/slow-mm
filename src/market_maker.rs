@@ -255,6 +255,8 @@ pub struct MmEngine {
     realized_pnl: f64,
     /// Last mid price used for PnL tracking
     last_mid: Option<f64>,
+    /// Cached max_inventory_tokens for use in instant hedge threshold
+    cached_max_inv: f64,
     /// Whether we are in maintenance wind-down mode
     in_maintenance_wind_down: bool,
     /// Running stats
@@ -323,6 +325,7 @@ impl MmEngine {
             last_order_time: None,
             realized_pnl: 0.0,
             last_mid: None,
+            cached_max_inv: 0.0,
             in_maintenance_wind_down: false,
             total_trades: 0,
             total_bid_fills: 0,
@@ -561,6 +564,7 @@ impl MmEngine {
         let leverage = self.cfg.max_leverage as f64;
         let order_size_tokens = equity * self.cfg.order_size_pct * leverage / mid;
         let max_inventory_tokens = equity * self.cfg.max_inventory_pct * leverage / mid;
+        self.cached_max_inv = max_inventory_tokens;
 
         // 7. Compute dynamic spread based on volatility
         let effective_spread_bps = self.compute_effective_spread();
@@ -916,47 +920,63 @@ impl MmEngine {
     // Hedge management
     // -----------------------------------------------------------------------
 
-    /// Safety-net hedge correction on each step cycle.
-    /// Instant hedge (check_fills_and_hedge) handles real-time hedging.
-    /// This only corrects residual net_exposure drift from rounding or missed fills.
-    async fn manage_hedge(&mut self, _max_inventory_tokens: f64, order_size_tokens: f64) {
+    /// Safety-net hedge on each step cycle.
+    /// Same threshold logic as instant hedge — only hedge excess beyond threshold.
+    /// Also handles closing hedge when inventory has decreased below close_threshold.
+    async fn manage_hedge(&mut self, max_inventory_tokens: f64, _order_size_tokens: f64) {
         let hedge_conn = match &self.hedge_conn {
             Some(c) => c.clone(),
             None => return,
         };
 
-        // Only correct if net_exposure has drifted beyond half an order size
         let net_exposure = self.inventory + self.hedge_position;
-        if net_exposure.abs() < order_size_tokens * 0.5 {
-            return;
-        }
+        let hedge_threshold = max_inventory_tokens * self.cfg.hedge_threshold_ratio;
+        let close_threshold = max_inventory_tokens * self.cfg.hedge_close_threshold_ratio;
 
-        let side = if net_exposure > 0.0 {
-            OrderSide::Short
-        } else {
-            OrderSide::Long
-        };
-        let size = self.round_size(net_exposure.abs());
-        if size <= Decimal::ZERO {
-            return;
-        }
-
-        log::info!(
-            "[HEDGE-CORRECT] net_exposure={:.6} side={:?} size={}",
-            net_exposure,
-            side,
-            size
-        );
-
-        match hedge_conn
-            .create_order(&self.cfg.symbol, size, side, None, None, false, None)
-            .await
-        {
-            Ok(_resp) => {
-                log::info!("[HEDGE-CORRECT] Correction placed: {:?} size={}", side, size);
+        if net_exposure.abs() > hedge_threshold {
+            // Hedge excess beyond threshold
+            let excess = net_exposure.abs() - hedge_threshold;
+            let side = if net_exposure > 0.0 {
+                OrderSide::Short
+            } else {
+                OrderSide::Long
+            };
+            let size = self.round_size(excess);
+            if size <= Decimal::ZERO {
+                return;
             }
-            Err(e) => {
-                log::error!("[HEDGE-CORRECT] Failed: {:?}", e);
+            log::info!(
+                "[HEDGE-STEP] net_exposure={:.6} threshold={:.6} excess={:.6} side={:?} size={}",
+                net_exposure, hedge_threshold, excess, side, size
+            );
+            match hedge_conn
+                .create_order(&self.cfg.symbol, size, side, None, None, false, None)
+                .await
+            {
+                Ok(_) => log::info!("[HEDGE-STEP] Placed: {:?} size={}", side, size),
+                Err(e) => log::error!("[HEDGE-STEP] Failed: {:?}", e),
+            }
+        } else if net_exposure.abs() <= close_threshold && self.hedge_position.abs() > 0.0 {
+            // Inventory back to normal — close hedge to free capital
+            let side = if self.hedge_position > 0.0 {
+                OrderSide::Short
+            } else {
+                OrderSide::Long
+            };
+            let size = self.round_size(self.hedge_position.abs());
+            if size <= Decimal::ZERO {
+                return;
+            }
+            log::info!(
+                "[HEDGE-STEP] Closing hedge: net_exposure={:.6} close_threshold={:.6} side={:?} size={}",
+                net_exposure, close_threshold, side, size
+            );
+            match hedge_conn
+                .create_order(&self.cfg.symbol, size, side, None, None, false, None)
+                .await
+            {
+                Ok(_) => log::info!("[HEDGE-STEP] Hedge closed: {:?} size={}", side, size),
+                Err(e) => log::error!("[HEDGE-STEP] Failed to close hedge: {:?}", e),
             }
         }
     }
@@ -1030,26 +1050,39 @@ impl MmEngine {
         // Update inventory from exchange position for accuracy
         self.sync_inventory_from_exchange().await;
 
-        // Hedge based on actual net_exposure (not fill_delta) to prevent rounding drift.
-        // net_exposure = inventory + hedge_position; we want it to be 0.
+        // Only hedge if net_exposure exceeds the threshold.
+        // Below threshold, inventory skew handles rebalancing naturally,
+        // preserving spread revenue. Hedge is insurance for large moves only.
         let net_exposure = self.inventory + self.hedge_position;
+        let hedge_threshold = self.cached_max_inv * self.cfg.hedge_threshold_ratio;
+
+        if net_exposure.abs() <= hedge_threshold {
+            log::debug!(
+                "[HEDGE-RT] net_exposure={:.6} within threshold={:.6}, skipping",
+                net_exposure,
+                hedge_threshold
+            );
+            return;
+        }
+
+        // Hedge only the excess beyond threshold, keeping some inventory for spread revenue
+        let excess = net_exposure.abs() - hedge_threshold;
         let hedge_conn = self.hedge_conn.as_ref().unwrap().clone();
         let hedge_side = if net_exposure > 0.0 {
-            // Net long → sell on hedge to flatten
             OrderSide::Short
         } else {
-            // Net short → buy on hedge to flatten
             OrderSide::Long
         };
-        let hedge_size = self.round_size(net_exposure.abs());
+        let hedge_size = self.round_size(excess);
         if hedge_size <= Decimal::ZERO {
             return;
         }
 
         log::info!(
-            "[HEDGE-RT] Instant hedge: fill_delta={:.6} net_exposure={:.6} side={:?} size={}",
-            fill_delta,
+            "[HEDGE-RT] Instant hedge: net_exposure={:.6} threshold={:.6} excess={:.6} side={:?} size={}",
             net_exposure,
+            hedge_threshold,
+            excess,
             hedge_side,
             hedge_size
         );
@@ -1060,7 +1093,6 @@ impl MmEngine {
         {
             Ok(_) => {
                 log::info!("[HEDGE-RT] Instant hedge placed: {:?} size={}", hedge_side, hedge_size);
-                // Sync hedge position
                 self.sync_inventory_from_exchange().await;
             }
             Err(e) => {
