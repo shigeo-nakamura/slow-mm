@@ -13,7 +13,7 @@ ob_depth: 5
 
 # Inventory management
 max_inventory_pct: 0.10    # 10% of equity as max unhedged inventory
-skew_factor: 0.5
+skew_factor: 1.5
 inventory_hard_limit_mult: 2.0
 
 # Volatility-adaptive spread
