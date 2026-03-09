@@ -40,6 +40,11 @@ const DEFAULT_FORCE_CLOSE_MULT: f64 = 1.5;
 const DEFAULT_FORCE_CLOSE_COOLDOWN_SECS: u64 = 120;
 const DEFAULT_OB_IMBALANCE_FACTOR: f64 = 1.0;
 const DEFAULT_FUNDING_RATE_FACTOR: f64 = 1.0;
+const DEFAULT_TREND_WINDOW: usize = 5;
+const DEFAULT_TREND_THRESHOLD_BPS: f64 = 3.0;
+const DEFAULT_POST_FILL_SPREAD_MULT: f64 = 2.0;
+const DEFAULT_POST_FILL_DECAY_SECS: u64 = 30;
+const DEFAULT_INVENTORY_SPREAD_MULT: f64 = 1.0;
 
 // ---------------------------------------------------------------------------
 // YAML config
@@ -73,6 +78,11 @@ struct MmYaml {
     ob_depth: Option<usize>,
     ob_imbalance_factor: Option<f64>,
     funding_rate_factor: Option<f64>,
+    trend_window: Option<usize>,
+    trend_threshold_bps: Option<f64>,
+    post_fill_spread_mult: Option<f64>,
+    post_fill_decay_secs: Option<u64>,
+    inventory_spread_mult: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +133,16 @@ pub struct MmConfig {
     pub ob_imbalance_factor: f64,
     /// Bias skew toward funding-rate-favorable side (0 = disabled)
     pub funding_rate_factor: f64,
+    /// Number of recent mid samples to detect short-term trend
+    pub trend_window: usize,
+    /// Trend threshold in bps: pause quoting on trend side if exceeded
+    pub trend_threshold_bps: f64,
+    /// Spread multiplier immediately after a fill (decays over time)
+    pub post_fill_spread_mult: f64,
+    /// Seconds for post-fill spread boost to decay back to 1.0
+    pub post_fill_decay_secs: u64,
+    /// Spread widens proportionally to inventory: spread *= (1 + |inv_ratio| * this)
+    pub inventory_spread_mult: f64,
 }
 
 impl MmConfig {
@@ -183,6 +203,19 @@ impl MmConfig {
             funding_rate_factor: yaml
                 .funding_rate_factor
                 .unwrap_or(DEFAULT_FUNDING_RATE_FACTOR),
+            trend_window: yaml.trend_window.unwrap_or(DEFAULT_TREND_WINDOW),
+            trend_threshold_bps: yaml
+                .trend_threshold_bps
+                .unwrap_or(DEFAULT_TREND_THRESHOLD_BPS),
+            post_fill_spread_mult: yaml
+                .post_fill_spread_mult
+                .unwrap_or(DEFAULT_POST_FILL_SPREAD_MULT),
+            post_fill_decay_secs: yaml
+                .post_fill_decay_secs
+                .unwrap_or(DEFAULT_POST_FILL_DECAY_SECS),
+            inventory_spread_mult: yaml
+                .inventory_spread_mult
+                .unwrap_or(DEFAULT_INVENTORY_SPREAD_MULT),
         };
         cfg.apply_env_overrides();
         Ok(cfg)
@@ -236,6 +269,20 @@ impl MmConfig {
             ob_depth: parse_env("OB_DEPTH", DEFAULT_OB_DEPTH),
             ob_imbalance_factor: parse_env("OB_IMBALANCE_FACTOR", DEFAULT_OB_IMBALANCE_FACTOR),
             funding_rate_factor: parse_env("FUNDING_RATE_FACTOR", DEFAULT_FUNDING_RATE_FACTOR),
+            trend_window: parse_env("TREND_WINDOW", DEFAULT_TREND_WINDOW),
+            trend_threshold_bps: parse_env("TREND_THRESHOLD_BPS", DEFAULT_TREND_THRESHOLD_BPS),
+            post_fill_spread_mult: parse_env(
+                "POST_FILL_SPREAD_MULT",
+                DEFAULT_POST_FILL_SPREAD_MULT,
+            ),
+            post_fill_decay_secs: parse_env(
+                "POST_FILL_DECAY_SECS",
+                DEFAULT_POST_FILL_DECAY_SECS,
+            ),
+            inventory_spread_mult: parse_env(
+                "INVENTORY_SPREAD_MULT",
+                DEFAULT_INVENTORY_SPREAD_MULT,
+            ),
         };
         cfg.apply_env_overrides();
         Ok(cfg)
@@ -296,6 +343,8 @@ pub struct MmEngine {
     last_force_close: Option<Instant>,
     /// Cached funding rate (refreshed with equity)
     cached_funding_rate: f64,
+    /// Last time a fill was detected (for post-fill spread boost)
+    last_fill_time: Option<Instant>,
     /// Running stats
     total_trades: u64,
     total_bid_fills: u64,
@@ -366,6 +415,7 @@ impl MmEngine {
             in_maintenance_wind_down: false,
             last_force_close: None,
             cached_funding_rate: 0.0,
+            last_fill_time: None,
             total_trades: 0,
             total_bid_fills: 0,
             total_ask_fills: 0,
@@ -606,7 +656,56 @@ impl MmEngine {
         self.cached_max_inv = max_inventory_tokens;
 
         // 7. Compute dynamic spread based on volatility
-        let effective_spread_bps = self.compute_effective_spread();
+        let mut effective_spread_bps = self.compute_effective_spread();
+
+        // 7a. Post-fill spread boost: widen spread right after a fill to avoid adverse selection
+        let post_fill_mult = if let Some(fill_time) = self.last_fill_time {
+            let elapsed = fill_time.elapsed().as_secs_f64();
+            let decay_secs = self.cfg.post_fill_decay_secs as f64;
+            if elapsed < decay_secs {
+                let t = 1.0 - elapsed / decay_secs; // 1.0 → 0.0
+                let mult = 1.0 + (self.cfg.post_fill_spread_mult - 1.0) * t;
+                log::debug!("[MM] Post-fill spread boost: {:.2}x (elapsed={:.0}s)", mult, elapsed);
+                mult
+            } else {
+                1.0
+            }
+        } else {
+            1.0
+        };
+        effective_spread_bps *= post_fill_mult;
+
+        // 7b. Inventory-based spread widening: wider spread when holding more inventory
+        if self.cfg.inventory_spread_mult > 0.0 && max_inventory_tokens > 0.0 {
+            let inv_ratio = (self.inventory.abs() / max_inventory_tokens).min(1.0);
+            let inv_mult = 1.0 + inv_ratio * self.cfg.inventory_spread_mult;
+            effective_spread_bps *= inv_mult;
+            if inv_ratio > 0.1 {
+                log::debug!(
+                    "[MM] Inventory spread: inv_ratio={:.2} mult={:.2}x spread={:.1}bps",
+                    inv_ratio, inv_mult, effective_spread_bps
+                );
+            }
+        }
+
+        // Clamp spread after all adjustments
+        effective_spread_bps = effective_spread_bps.clamp(self.cfg.min_spread_bps, self.cfg.max_spread_bps);
+
+        // 7c. Trend detection: pause quoting on the trend side to avoid adverse selection
+        let trend_bps = self.compute_trend_bps();
+        let mut trend_pause_bid = false;
+        let mut trend_pause_ask = false;
+        if trend_bps.abs() > self.cfg.trend_threshold_bps {
+            if trend_bps > 0.0 {
+                // Price rising → don't sell into it (ASK will get adversely selected)
+                trend_pause_ask = true;
+                log::info!("[MM] Trend UP {:.1}bps > {:.1}bps: pausing ASK", trend_bps, self.cfg.trend_threshold_bps);
+            } else {
+                // Price falling → don't buy into it (BID will get adversely selected)
+                trend_pause_bid = true;
+                log::info!("[MM] Trend DOWN {:.1}bps > {:.1}bps: pausing BID", trend_bps.abs(), self.cfg.trend_threshold_bps);
+            }
+        }
 
         // 8. Compute skew based on inventory
         let inv_skew_bps = self.compute_skew_bps(max_inventory_tokens);
@@ -665,8 +764,8 @@ impl MmEngine {
 
         // 9. Determine if we should quote on each side
         let hard_limit = max_inventory_tokens * self.cfg.inventory_hard_limit_mult;
-        let quote_bid = self.inventory < hard_limit;
-        let quote_ask = self.inventory > -hard_limit;
+        let quote_bid = self.inventory < hard_limit && !trend_pause_bid;
+        let quote_ask = self.inventory > -hard_limit && !trend_pause_ask;
 
         // 8a. Force-close if inventory exceeds hard_limit * force_close_mult
         let force_close_limit = hard_limit * self.cfg.force_close_mult;
@@ -985,6 +1084,7 @@ impl MmEngine {
                     }
 
                     self.total_trades += 1;
+                    self.last_fill_time = Some(Instant::now());
                     match fill.filled_side {
                         Some(OrderSide::Long) => {
                             self.total_bid_fills += 1;
@@ -1052,6 +1152,22 @@ impl MmEngine {
         let inv_ratio = (self.inventory / max_inventory_tokens).clamp(-1.0, 1.0);
         // Skew in bps: positive when long (pushes bid down, ask down => easier to sell)
         inv_ratio * self.cfg.skew_factor * self.cfg.spread_bps
+    }
+
+    /// Short-term trend in bps: positive = price rising, negative = falling.
+    /// Uses last N mid prices (trend_window).
+    fn compute_trend_bps(&self) -> f64 {
+        let w = self.cfg.trend_window;
+        if self.mid_prices.len() < w + 1 {
+            return 0.0;
+        }
+        let recent = &self.mid_prices[self.mid_prices.len() - w - 1..];
+        let first = recent[0];
+        let last = recent[w];
+        if first <= 0.0 {
+            return 0.0;
+        }
+        (last - first) / first * 10_000.0
     }
 
     // -----------------------------------------------------------------------
