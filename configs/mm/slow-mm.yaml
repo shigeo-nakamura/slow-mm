@@ -10,6 +10,8 @@ order_size_pct: 0.02       # 2% of equity per order level
 order_levels: 3
 level_spacing_bps: 5
 ob_depth: 5
+ob_imbalance_factor: 1.0       # shift spread based on bid/ask depth imbalance
+funding_rate_factor: 1.0       # bias skew toward FR-favorable side
 
 # Inventory management
 max_inventory_pct: 0.10    # 10% of equity as max unhedged inventory

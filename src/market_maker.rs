@@ -38,6 +38,8 @@ const DEFAULT_MAX_SPREAD_BPS: f64 = 50.0;
 const DEFAULT_OB_DEPTH: usize = 5;
 const DEFAULT_FORCE_CLOSE_MULT: f64 = 1.5;
 const DEFAULT_FORCE_CLOSE_COOLDOWN_SECS: u64 = 120;
+const DEFAULT_OB_IMBALANCE_FACTOR: f64 = 1.0;
+const DEFAULT_FUNDING_RATE_FACTOR: f64 = 1.0;
 
 // ---------------------------------------------------------------------------
 // YAML config
@@ -69,6 +71,8 @@ struct MmYaml {
     min_spread_bps: Option<f64>,
     max_spread_bps: Option<f64>,
     ob_depth: Option<usize>,
+    ob_imbalance_factor: Option<f64>,
+    funding_rate_factor: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +119,10 @@ pub struct MmConfig {
     pub min_spread_bps: f64,
     pub max_spread_bps: f64,
     pub ob_depth: usize,
+    /// Shift spread based on order book imbalance (0 = disabled)
+    pub ob_imbalance_factor: f64,
+    /// Bias skew toward funding-rate-favorable side (0 = disabled)
+    pub funding_rate_factor: f64,
 }
 
 impl MmConfig {
@@ -169,6 +177,12 @@ impl MmConfig {
             min_spread_bps: yaml.min_spread_bps.unwrap_or(DEFAULT_MIN_SPREAD_BPS),
             max_spread_bps: yaml.max_spread_bps.unwrap_or(DEFAULT_MAX_SPREAD_BPS),
             ob_depth: yaml.ob_depth.unwrap_or(DEFAULT_OB_DEPTH),
+            ob_imbalance_factor: yaml
+                .ob_imbalance_factor
+                .unwrap_or(DEFAULT_OB_IMBALANCE_FACTOR),
+            funding_rate_factor: yaml
+                .funding_rate_factor
+                .unwrap_or(DEFAULT_FUNDING_RATE_FACTOR),
         };
         cfg.apply_env_overrides();
         Ok(cfg)
@@ -220,6 +234,8 @@ impl MmConfig {
             min_spread_bps: parse_env("MIN_SPREAD_BPS", DEFAULT_MIN_SPREAD_BPS),
             max_spread_bps: parse_env("MAX_SPREAD_BPS", DEFAULT_MAX_SPREAD_BPS),
             ob_depth: parse_env("OB_DEPTH", DEFAULT_OB_DEPTH),
+            ob_imbalance_factor: parse_env("OB_IMBALANCE_FACTOR", DEFAULT_OB_IMBALANCE_FACTOR),
+            funding_rate_factor: parse_env("FUNDING_RATE_FACTOR", DEFAULT_FUNDING_RATE_FACTOR),
         };
         cfg.apply_env_overrides();
         Ok(cfg)
@@ -278,6 +294,8 @@ pub struct MmEngine {
     in_maintenance_wind_down: bool,
     /// Last time force-close was triggered (cooldown)
     last_force_close: Option<Instant>,
+    /// Cached funding rate (refreshed with equity)
+    cached_funding_rate: f64,
     /// Running stats
     total_trades: u64,
     total_bid_fills: u64,
@@ -347,6 +365,7 @@ impl MmEngine {
             cached_max_inv: 0.0,
             in_maintenance_wind_down: false,
             last_force_close: None,
+            cached_funding_rate: 0.0,
             total_trades: 0,
             total_bid_fills: 0,
             total_ask_fills: 0,
@@ -590,7 +609,55 @@ impl MmEngine {
         let effective_spread_bps = self.compute_effective_spread();
 
         // 8. Compute skew based on inventory
-        let skew_bps = self.compute_skew_bps(max_inventory_tokens);
+        let inv_skew_bps = self.compute_skew_bps(max_inventory_tokens);
+
+        // 8a. OB imbalance shift: if bids are thicker, price likely to rise → shift ask closer
+        let ob_shift_bps = if self.cfg.ob_imbalance_factor != 0.0 {
+            let bid_depth: f64 = ob
+                .bids
+                .iter()
+                .map(|l| l.size.to_f64().unwrap_or(0.0))
+                .sum();
+            let ask_depth: f64 = ob
+                .asks
+                .iter()
+                .map(|l| l.size.to_f64().unwrap_or(0.0))
+                .sum();
+            let total = bid_depth + ask_depth;
+            if total > 0.0 {
+                // imbalance: +1 = all bids, -1 = all asks
+                let imbalance = (bid_depth - ask_depth) / total;
+                // Positive imbalance (more bids) → negative shift → pull ask closer (sell into strength)
+                let shift = -imbalance * self.cfg.ob_imbalance_factor * effective_spread_bps * 0.5;
+                log::debug!(
+                    "[MM] OB imbalance: bid_depth={:.4} ask_depth={:.4} imbalance={:.2} shift_bps={:.2}",
+                    bid_depth, ask_depth, imbalance, shift
+                );
+                shift
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        // 8b. Funding rate bias: FR>0 means longs pay shorts → favor short (reduce bid, widen ask)
+        let fr_skew_bps = if self.cfg.funding_rate_factor != 0.0 && self.cached_funding_rate != 0.0
+        {
+            // FR is typically small (e.g., 0.0001 = 1bps per period)
+            // Convert to bps and scale by factor
+            let fr_bps = self.cached_funding_rate * 10_000.0 * self.cfg.funding_rate_factor;
+            log::debug!(
+                "[MM] FR bias: rate={:.6} fr_skew_bps={:.2}",
+                self.cached_funding_rate,
+                fr_bps
+            );
+            fr_bps
+        } else {
+            0.0
+        };
+
+        let skew_bps = inv_skew_bps + ob_shift_bps + fr_skew_bps;
 
         let half_spread_bps = effective_spread_bps / 2.0;
         let bid_offset_bps = half_spread_bps + skew_bps; // positive skew pushes bid down when long
@@ -829,6 +896,21 @@ impl MmEngine {
                 }
                 Err(e) => {
                     log::warn!("[MM] Failed to get hedge balance: {:?}", e);
+                }
+            }
+        }
+        // Refresh funding rate
+        if self.cfg.funding_rate_factor != 0.0 {
+            match self.main_conn.get_ticker(&self.cfg.symbol, None).await {
+                Ok(ticker) => {
+                    self.cached_funding_rate = ticker
+                        .funding_rate
+                        .and_then(|r| r.to_f64())
+                        .unwrap_or(0.0);
+                    log::debug!("[MM] Funding rate refreshed: {:.6}", self.cached_funding_rate);
+                }
+                Err(e) => {
+                    log::warn!("[MM] Failed to get funding rate: {:?}", e);
                 }
             }
         }
