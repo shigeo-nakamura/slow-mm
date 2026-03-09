@@ -698,12 +698,23 @@ impl MmEngine {
         if trend_bps.abs() > self.cfg.trend_threshold_bps {
             if trend_bps > 0.0 {
                 // Price rising → don't sell into it (ASK will get adversely selected)
-                trend_pause_ask = true;
-                log::info!("[MM] Trend UP {:.1}bps > {:.1}bps: pausing ASK", trend_bps, self.cfg.trend_threshold_bps);
+                // But only pause if we're NOT short (short needs ASK to close? no — short needs BID to close)
+                // ASK = sell = increases short. Only pause if not already long (selling would reduce long = good)
+                if self.inventory <= 0.0 {
+                    trend_pause_ask = true;
+                    log::info!("[MM] Trend UP {:.1}bps > {:.1}bps: pausing ASK (inv={:.6})", trend_bps, self.cfg.trend_threshold_bps, self.inventory);
+                } else {
+                    log::debug!("[MM] Trend UP {:.1}bps but long inv={:.6}, allowing ASK to reduce position", trend_bps, self.inventory);
+                }
             } else {
                 // Price falling → don't buy into it (BID will get adversely selected)
-                trend_pause_bid = true;
-                log::info!("[MM] Trend DOWN {:.1}bps > {:.1}bps: pausing BID", trend_bps.abs(), self.cfg.trend_threshold_bps);
+                // But only pause if we're NOT short (BID = buy = reduces short = good)
+                if self.inventory >= 0.0 {
+                    trend_pause_bid = true;
+                    log::info!("[MM] Trend DOWN {:.1}bps > {:.1}bps: pausing BID (inv={:.6})", trend_bps.abs(), self.cfg.trend_threshold_bps, self.inventory);
+                } else {
+                    log::debug!("[MM] Trend DOWN {:.1}bps but short inv={:.6}, allowing BID to reduce position", trend_bps.abs(), self.inventory);
+                }
             }
         }
 
