@@ -675,18 +675,33 @@ impl MmEngine {
         };
         effective_spread_bps *= post_fill_mult;
 
-        // 7b. Inventory-based spread widening: wider spread when holding more inventory
-        if self.cfg.inventory_spread_mult > 0.0 && max_inventory_tokens > 0.0 {
-            let inv_ratio = (self.inventory.abs() / max_inventory_tokens).min(1.0);
-            let inv_mult = 1.0 + inv_ratio * self.cfg.inventory_spread_mult;
-            effective_spread_bps *= inv_mult;
-            if inv_ratio > 0.1 {
-                log::debug!(
-                    "[MM] Inventory spread: inv_ratio={:.2} mult={:.2}x spread={:.1}bps",
-                    inv_ratio, inv_mult, effective_spread_bps
-                );
-            }
-        }
+        // 7b. Inventory-based spread widening: asymmetric — only widen on position-increasing side
+        let (inv_spread_bid_mult, inv_spread_ask_mult) =
+            if self.cfg.inventory_spread_mult > 0.0 && max_inventory_tokens > 0.0 {
+                let inv_ratio = (self.inventory.abs() / max_inventory_tokens).min(1.0);
+                let widen = 1.0 + inv_ratio * self.cfg.inventory_spread_mult;
+                if inv_ratio > 0.1 {
+                    if self.inventory > 0.0 {
+                        // Long → widen BID (buying increases risk), keep ASK tight (selling reduces)
+                        log::debug!(
+                            "[MM] Inventory spread: long inv_ratio={:.2} BID mult={:.2}x ASK mult=1.00x",
+                            inv_ratio, widen
+                        );
+                        (widen, 1.0)
+                    } else {
+                        // Short → widen ASK (selling increases risk), keep BID tight (buying reduces)
+                        log::debug!(
+                            "[MM] Inventory spread: short inv_ratio={:.2} BID mult=1.00x ASK mult={:.2}x",
+                            inv_ratio, widen
+                        );
+                        (1.0, widen)
+                    }
+                } else {
+                    (1.0, 1.0)
+                }
+            } else {
+                (1.0, 1.0)
+            };
 
         // Clamp spread after all adjustments
         effective_spread_bps = effective_spread_bps.clamp(self.cfg.min_spread_bps, self.cfg.max_spread_bps);
@@ -770,8 +785,8 @@ impl MmEngine {
         let skew_bps = inv_skew_bps + ob_shift_bps + fr_skew_bps;
 
         let half_spread_bps = effective_spread_bps / 2.0;
-        let bid_offset_bps = half_spread_bps + skew_bps; // positive skew pushes bid down when long
-        let ask_offset_bps = half_spread_bps - skew_bps; // positive skew pulls ask down when long
+        let bid_offset_bps = half_spread_bps * inv_spread_bid_mult + skew_bps;
+        let ask_offset_bps = half_spread_bps * inv_spread_ask_mult - skew_bps;
 
         // 9. Determine if we should quote on each side
         let hard_limit = max_inventory_tokens * self.cfg.inventory_hard_limit_mult;
