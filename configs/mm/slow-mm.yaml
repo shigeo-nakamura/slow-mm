@@ -27,7 +27,7 @@ min_spread_bps: 2
 max_spread_bps: 50
 
 # Adverse selection protection
-trend_window: 5                # mid samples for trend detection
+trend_window: 10               # mid samples for trend detection (10 × 30s = 5min)
 trend_threshold_bps: 3.0       # pause quoting on trend side if exceeded
 post_fill_spread_mult: 2.0     # spread multiplier right after fill (decays)
 post_fill_decay_secs: 30       # seconds for post-fill boost to decay
