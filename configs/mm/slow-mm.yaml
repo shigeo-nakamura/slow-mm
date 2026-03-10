@@ -2,7 +2,7 @@ symbol: BTC
 dry_run: false
 
 # Timing
-interval_secs: 60
+interval_secs: 30
 
 # Spread / quoting
 spread_bps: 4
