@@ -41,4 +41,4 @@ hedge_close_threshold_ratio: 0.1
 # Risk
 max_leverage: 20
 equity_usd_fallback: 500
-stale_order_secs: 300
+stale_order_secs: 45
