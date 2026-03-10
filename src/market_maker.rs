@@ -706,29 +706,38 @@ impl MmEngine {
         // Clamp spread after all adjustments
         effective_spread_bps = effective_spread_bps.clamp(self.cfg.min_spread_bps, self.cfg.max_spread_bps);
 
-        // 7c. Trend detection: pause quoting on the trend side to avoid adverse selection
+        // 7c. Trend detection: pause position-increasing side, allow position-reducing side
         let trend_bps = self.compute_trend_bps();
         let mut trend_pause_bid = false;
         let mut trend_pause_ask = false;
         if trend_bps.abs() > self.cfg.trend_threshold_bps {
             if trend_bps > 0.0 {
-                // Price rising → don't sell into it (ASK will get adversely selected)
-                // But only pause if we're NOT short (short needs ASK to close? no — short needs BID to close)
-                // ASK = sell = increases short. Only pause if not already long (selling would reduce long = good)
-                if self.inventory <= 0.0 {
-                    trend_pause_ask = true;
-                    log::info!("[MM] Trend UP {:.1}bps > {:.1}bps: pausing ASK (inv={:.6})", trend_bps, self.cfg.trend_threshold_bps, self.inventory);
+                // Price rising:
+                //   - Always pause BID if long (buying increases adverse long exposure)
+                //   - Pause ASK if not long (selling into uptrend = adverse selection)
+                //   - Allow ASK if long (selling reduces position)
+                if self.inventory > 0.0 {
+                    trend_pause_bid = true;
+                    log::info!("[MM] Trend UP {:.1}bps > {:.1}bps: pausing BID (long inv={:.6}), allowing ASK to reduce",
+                        trend_bps, self.cfg.trend_threshold_bps, self.inventory);
                 } else {
-                    log::debug!("[MM] Trend UP {:.1}bps but long inv={:.6}, allowing ASK to reduce position", trend_bps, self.inventory);
+                    trend_pause_ask = true;
+                    log::info!("[MM] Trend UP {:.1}bps > {:.1}bps: pausing ASK (inv={:.6})",
+                        trend_bps, self.cfg.trend_threshold_bps, self.inventory);
                 }
             } else {
-                // Price falling → don't buy into it (BID will get adversely selected)
-                // But only pause if we're NOT short (BID = buy = reduces short = good)
-                if self.inventory >= 0.0 {
-                    trend_pause_bid = true;
-                    log::info!("[MM] Trend DOWN {:.1}bps > {:.1}bps: pausing BID (inv={:.6})", trend_bps.abs(), self.cfg.trend_threshold_bps, self.inventory);
+                // Price falling:
+                //   - Always pause ASK if short (selling increases adverse short exposure)
+                //   - Pause BID if not short (buying into downtrend = adverse selection)
+                //   - Allow BID if short (buying reduces position)
+                if self.inventory < 0.0 {
+                    trend_pause_ask = true;
+                    log::info!("[MM] Trend DOWN {:.1}bps > {:.1}bps: pausing ASK (short inv={:.6}), allowing BID to reduce",
+                        trend_bps.abs(), self.cfg.trend_threshold_bps, self.inventory);
                 } else {
-                    log::debug!("[MM] Trend DOWN {:.1}bps but short inv={:.6}, allowing BID to reduce position", trend_bps.abs(), self.inventory);
+                    trend_pause_bid = true;
+                    log::info!("[MM] Trend DOWN {:.1}bps > {:.1}bps: pausing BID (inv={:.6})",
+                        trend_bps.abs(), self.cfg.trend_threshold_bps, self.inventory);
                 }
             }
         }
