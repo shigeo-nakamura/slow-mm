@@ -31,7 +31,7 @@ trend_window: 10               # mid samples for trend detection (10 × 60s = 10
 trend_threshold_bps: 3.0       # legacy: pause one side if exceeded
 ema_short_periods: 5           # EMA short period (~5 min with 60s interval)
 ema_long_periods: 20           # EMA long period (~20 min with 60s interval)
-trend_strength_threshold: 2.0  # bps: pause BOTH sides when |EMA_short - EMA_long| exceeds this
+trend_strength_threshold: 5.0  # bps: pause BOTH sides when |EMA_short - EMA_long| exceeds this
 post_fill_spread_mult: 2.0     # spread multiplier right after fill (decays)
 post_fill_decay_secs: 30       # seconds for post-fill boost to decay
 inventory_spread_mult: 1.0     # spread widens proportional to |inventory|
