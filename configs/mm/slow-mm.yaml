@@ -5,9 +5,9 @@ dry_run: false
 interval_secs: 60
 
 # Spread / quoting
-spread_bps: 6
+spread_bps: 3
 order_size_pct: 0.02       # 2% of equity per order level
-order_levels: 2
+order_levels: 1
 level_spacing_bps: 5
 ob_depth: 5
 ob_imbalance_factor: 1.0       # shift spread based on bid/ask depth imbalance
@@ -23,12 +23,15 @@ force_close_cooldown_secs: 120 # min seconds between force-close actions
 # Volatility-adaptive spread
 volatility_window: 60
 volatility_spread_mult: 0.5
-min_spread_bps: 4
+min_spread_bps: 2
 max_spread_bps: 50
 
 # Adverse selection protection
-trend_window: 10               # mid samples for trend detection (10 × 30s = 5min)
-trend_threshold_bps: 3.0       # pause quoting on trend side if exceeded
+trend_window: 10               # mid samples for trend detection (10 × 60s = 10min)
+trend_threshold_bps: 3.0       # legacy: pause one side if exceeded
+ema_short_periods: 5           # EMA short period (~5 min with 60s interval)
+ema_long_periods: 20           # EMA long period (~20 min with 60s interval)
+trend_strength_threshold: 2.0  # bps: pause BOTH sides when |EMA_short - EMA_long| exceeds this
 post_fill_spread_mult: 2.0     # spread multiplier right after fill (decays)
 post_fill_decay_secs: 30       # seconds for post-fill boost to decay
 inventory_spread_mult: 1.0     # spread widens proportional to |inventory|

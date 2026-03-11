@@ -42,6 +42,9 @@ const DEFAULT_OB_IMBALANCE_FACTOR: f64 = 1.0;
 const DEFAULT_FUNDING_RATE_FACTOR: f64 = 1.0;
 const DEFAULT_TREND_WINDOW: usize = 5;
 const DEFAULT_TREND_THRESHOLD_BPS: f64 = 3.0;
+const DEFAULT_EMA_SHORT_PERIODS: usize = 5;
+const DEFAULT_EMA_LONG_PERIODS: usize = 20;
+const DEFAULT_TREND_STRENGTH_THRESHOLD: f64 = 2.0;
 const DEFAULT_POST_FILL_SPREAD_MULT: f64 = 2.0;
 const DEFAULT_POST_FILL_DECAY_SECS: u64 = 30;
 const DEFAULT_INVENTORY_SPREAD_MULT: f64 = 1.0;
@@ -80,6 +83,9 @@ struct MmYaml {
     funding_rate_factor: Option<f64>,
     trend_window: Option<usize>,
     trend_threshold_bps: Option<f64>,
+    ema_short_periods: Option<usize>,
+    ema_long_periods: Option<usize>,
+    trend_strength_threshold: Option<f64>,
     post_fill_spread_mult: Option<f64>,
     post_fill_decay_secs: Option<u64>,
     inventory_spread_mult: Option<f64>,
@@ -137,6 +143,12 @@ pub struct MmConfig {
     pub trend_window: usize,
     /// Trend threshold in bps: pause quoting on trend side if exceeded
     pub trend_threshold_bps: f64,
+    /// EMA short period for trend detection
+    pub ema_short_periods: usize,
+    /// EMA long period for trend detection
+    pub ema_long_periods: usize,
+    /// EMA trend strength threshold in bps: pause BOTH sides when |EMA_short - EMA_long| exceeds this
+    pub trend_strength_threshold: f64,
     /// Spread multiplier immediately after a fill (decays over time)
     pub post_fill_spread_mult: f64,
     /// Seconds for post-fill spread boost to decay back to 1.0
@@ -207,6 +219,15 @@ impl MmConfig {
             trend_threshold_bps: yaml
                 .trend_threshold_bps
                 .unwrap_or(DEFAULT_TREND_THRESHOLD_BPS),
+            ema_short_periods: yaml
+                .ema_short_periods
+                .unwrap_or(DEFAULT_EMA_SHORT_PERIODS),
+            ema_long_periods: yaml
+                .ema_long_periods
+                .unwrap_or(DEFAULT_EMA_LONG_PERIODS),
+            trend_strength_threshold: yaml
+                .trend_strength_threshold
+                .unwrap_or(DEFAULT_TREND_STRENGTH_THRESHOLD),
             post_fill_spread_mult: yaml
                 .post_fill_spread_mult
                 .unwrap_or(DEFAULT_POST_FILL_SPREAD_MULT),
@@ -271,6 +292,12 @@ impl MmConfig {
             funding_rate_factor: parse_env("FUNDING_RATE_FACTOR", DEFAULT_FUNDING_RATE_FACTOR),
             trend_window: parse_env("TREND_WINDOW", DEFAULT_TREND_WINDOW),
             trend_threshold_bps: parse_env("TREND_THRESHOLD_BPS", DEFAULT_TREND_THRESHOLD_BPS),
+            ema_short_periods: parse_env("EMA_SHORT_PERIODS", DEFAULT_EMA_SHORT_PERIODS),
+            ema_long_periods: parse_env("EMA_LONG_PERIODS", DEFAULT_EMA_LONG_PERIODS),
+            trend_strength_threshold: parse_env(
+                "TREND_STRENGTH_THRESHOLD",
+                DEFAULT_TREND_STRENGTH_THRESHOLD,
+            ),
             post_fill_spread_mult: parse_env(
                 "POST_FILL_SPREAD_MULT",
                 DEFAULT_POST_FILL_SPREAD_MULT,
@@ -343,6 +370,10 @@ pub struct MmEngine {
     last_force_close: Option<Instant>,
     /// Cached funding rate (refreshed with equity)
     cached_funding_rate: f64,
+    /// EMA short value for trend detection
+    ema_short: Option<f64>,
+    /// EMA long value for trend detection
+    ema_long: Option<f64>,
     /// Last time a fill was detected (for post-fill spread boost)
     last_fill_time: Option<Instant>,
     /// Running stats
@@ -415,6 +446,8 @@ impl MmEngine {
             in_maintenance_wind_down: false,
             last_force_close: None,
             cached_funding_rate: 0.0,
+            ema_short: None,
+            ema_long: None,
             last_fill_time: None,
             total_trades: 0,
             total_bid_fills: 0,
@@ -615,7 +648,10 @@ impl MmEngine {
             return Ok(());
         }
 
-        // 1. Get order book to determine mid price
+        // 1. Cancel existing orders BEFORE reading OB (so our own orders don't pollute best bid/ask)
+        self.cancel_all_main_orders().await;
+
+        // 1b. Get order book to determine mid price (clean of our own orders)
         let ob = self
             .main_conn
             .get_order_book(&self.cfg.symbol, self.cfg.ob_depth)
@@ -646,6 +682,9 @@ impl MmEngine {
             self.mid_prices
                 .drain(0..self.mid_prices.len() - self.cfg.volatility_window);
         }
+
+        // 2b. Update EMA-based trend detector
+        self.update_ema(mid);
 
         // 3. Sync inventory from exchange positions
         self.sync_inventory_from_exchange().await;
@@ -714,35 +753,33 @@ impl MmEngine {
         // Clamp spread after all adjustments
         effective_spread_bps = effective_spread_bps.clamp(self.cfg.min_spread_bps, self.cfg.max_spread_bps);
 
-        // 7c. Trend detection: pause position-increasing side, allow position-reducing side
-        let trend_bps = self.compute_trend_bps();
+        // 7c. EMA-based trend detection: pause BOTH sides when trend is strong
+        let ema_trend_bps = self.compute_ema_trend_bps();
+        let trend_bps = self.compute_trend_bps(); // keep legacy for logging
         let mut trend_pause_bid = false;
         let mut trend_pause_ask = false;
-        if trend_bps.abs() > self.cfg.trend_threshold_bps {
+
+        if ema_trend_bps.abs() > self.cfg.trend_strength_threshold {
+            // Strong trend detected — stop quoting on BOTH sides to avoid adverse selection
+            trend_pause_bid = true;
+            trend_pause_ask = true;
+            let direction = if ema_trend_bps > 0.0 { "UP" } else { "DOWN" };
+            log::info!(
+                "[MM] TREND {} detected: EMA divergence {:.1}bps > {:.1}bps threshold, legacy_trend={:.1}bps — pausing BOTH sides",
+                direction, ema_trend_bps.abs(), self.cfg.trend_strength_threshold, trend_bps
+            );
+        } else if trend_bps.abs() > self.cfg.trend_threshold_bps {
+            // Moderate trend (legacy) — pause only the position-increasing side
             if trend_bps > 0.0 {
-                if self.inventory > 0.0 {
-                    // Rising + long → pause BID (stop buying), allow ASK (reduce)
-                    trend_pause_bid = true;
-                    log::info!("[MM] Trend UP {:.1}bps > {:.1}bps: pausing BID (long inv={:.6}), allowing ASK to reduce",
-                        trend_bps, self.cfg.trend_threshold_bps, self.inventory);
-                } else {
-                    // Rising + flat/short → pause ASK (avoid adverse selection buying high)
-                    trend_pause_ask = true;
-                    log::info!("[MM] Trend UP {:.1}bps > {:.1}bps: pausing ASK (inv={:.6})",
-                        trend_bps, self.cfg.trend_threshold_bps, self.inventory);
-                }
+                // Rising → pause BID (stop buying)
+                trend_pause_bid = true;
+                log::info!("[MM] Moderate trend UP {:.1}bps: pausing BID (inv={:.6})",
+                    trend_bps, self.inventory);
             } else {
-                if self.inventory < 0.0 {
-                    // Falling + short → pause ASK (stop selling), allow BID (reduce)
-                    trend_pause_ask = true;
-                    log::info!("[MM] Trend DOWN {:.1}bps > {:.1}bps: pausing ASK (short inv={:.6}), allowing BID to reduce",
-                        trend_bps.abs(), self.cfg.trend_threshold_bps, self.inventory);
-                } else {
-                    // Falling + flat/long → pause BID (avoid adverse selection buying low)
-                    trend_pause_bid = true;
-                    log::info!("[MM] Trend DOWN {:.1}bps > {:.1}bps: pausing BID (inv={:.6})",
-                        trend_bps.abs(), self.cfg.trend_threshold_bps, self.inventory);
-                }
+                // Falling → pause ASK (stop selling)
+                trend_pause_ask = true;
+                log::info!("[MM] Moderate trend DOWN {:.1}bps: pausing ASK (inv={:.6})",
+                    trend_bps.abs(), self.inventory);
             }
         }
 
@@ -842,17 +879,11 @@ impl MmEngine {
             }
         }
 
-        // 8b. Cancel existing orders and place new ones
-        self.cancel_all_main_orders().await;
-
+        // 8b. Place new orders (cancel already done at step start)
         let mut new_bid_ids = Vec::new();
         let mut new_ask_ids = Vec::new();
 
         // Place bid orders (buy side)
-        // Clamp to best_bid: never bid above current best_bid (queue behind existing orders)
-        let best_bid_dec = self.round_price(best_bid);
-        let best_ask_dec = self.round_price(best_ask);
-
         if quote_bid {
             for level in 0..self.cfg.order_levels {
                 let level_extra_bps = level as f64 * self.cfg.level_spacing_bps;
@@ -863,18 +894,7 @@ impl MmEngine {
                     continue;
                 }
 
-                let mut bid_price_dec = self.round_price(bid_price);
-
-                // Clamp: never bid above best_bid to avoid crossing the spread
-                // and to queue behind informed flow
-                if bid_price_dec > best_bid_dec {
-                    log::debug!(
-                        "[MM] BID L{} clamped {} → {} (best_bid)",
-                        level, bid_price_dec, best_bid_dec
-                    );
-                    bid_price_dec = best_bid_dec;
-                }
-
+                let bid_price_dec = self.round_price(bid_price);
                 let size_dec = self.round_size(order_size_tokens);
 
                 if size_dec <= Decimal::ZERO || bid_price_dec <= Decimal::ZERO {
@@ -927,18 +947,7 @@ impl MmEngine {
                     continue;
                 }
 
-                let mut ask_price_dec = self.round_price(ask_price);
-
-                // Clamp: never ask below best_ask to avoid crossing the spread
-                // and to queue behind informed flow
-                if ask_price_dec < best_ask_dec {
-                    log::debug!(
-                        "[MM] ASK L{} clamped {} → {} (best_ask)",
-                        level, ask_price_dec, best_ask_dec
-                    );
-                    ask_price_dec = best_ask_dec;
-                }
-
+                let ask_price_dec = self.round_price(ask_price);
                 let size_dec = self.round_size(order_size_tokens);
 
                 if size_dec <= Decimal::ZERO || ask_price_dec <= Decimal::ZERO {
@@ -1233,6 +1242,32 @@ impl MmEngine {
             return 0.0;
         }
         (last - first) / first * 10_000.0
+    }
+
+    /// Update EMA short and long with a new mid price.
+    fn update_ema(&mut self, mid: f64) {
+        let alpha_short = 2.0 / (self.cfg.ema_short_periods as f64 + 1.0);
+        let alpha_long = 2.0 / (self.cfg.ema_long_periods as f64 + 1.0);
+
+        self.ema_short = Some(match self.ema_short {
+            Some(prev) => alpha_short * mid + (1.0 - alpha_short) * prev,
+            None => mid,
+        });
+        self.ema_long = Some(match self.ema_long {
+            Some(prev) => alpha_long * mid + (1.0 - alpha_long) * prev,
+            None => mid,
+        });
+    }
+
+    /// Compute EMA-based trend strength in bps.
+    /// Positive = short EMA above long EMA (uptrend), negative = downtrend.
+    fn compute_ema_trend_bps(&self) -> f64 {
+        match (self.ema_short, self.ema_long) {
+            (Some(short), Some(long)) if long > 0.0 => {
+                (short - long) / long * 10_000.0
+            }
+            _ => 0.0,
+        }
     }
 
     // -----------------------------------------------------------------------
