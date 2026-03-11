@@ -502,7 +502,15 @@ impl MmEngine {
                     }
                 }
                 _ = fill_checker.tick() => {
-                    self.check_fills_and_hedge().await;
+                    if self.check_fills_and_rebalance().await {
+                        // Fill detected → immediate cancel & re-quote with updated inventory
+                        log::info!("[MM] Immediate rebalance after fill");
+                        if let Err(e) = self.step().await {
+                            log::error!("[MM] rebalance step failed: {:?}", e);
+                        }
+                        // Reset ticker so we don't double-step soon after
+                        ticker.reset();
+                    }
                 }
                 _ = sigterm.recv() => {
                     log::info!("[MM] SIGTERM received, shutting down...");
@@ -1283,24 +1291,24 @@ impl MmEngine {
     }
 
     // -----------------------------------------------------------------------
-    // Real-time fill detection → instant hedge
+    // Real-time fill detection → instant rebalance & hedge
     // -----------------------------------------------------------------------
 
-    /// Called every 2s to detect new fills and hedge immediately.
-    /// This avoids waiting for the full 60s step cycle.
-    async fn check_fills_and_hedge(&mut self) {
-        if !self.cfg.hedge_enabled || self.hedge_conn.is_none() || self.in_maintenance_wind_down {
-            return;
+    /// Called every 2s to detect new fills. Returns true if fills were detected,
+    /// triggering an immediate rebalance cycle in the main loop.
+    async fn check_fills_and_rebalance(&mut self) -> bool {
+        if self.in_maintenance_wind_down {
+            return false;
         }
 
         // Check for new fills via WebSocket cache
         let fills = match self.main_conn.get_filled_orders(&self.cfg.symbol).await {
             Ok(f) => f,
-            Err(_) => return,
+            Err(_) => return false,
         };
 
         if fills.orders.is_empty() {
-            return;
+            return false;
         }
 
         // Process fills and update inventory
@@ -1345,69 +1353,63 @@ impl MmEngine {
         }
 
         if fill_delta.abs() < 1e-10 {
-            return;
+            return false;
         }
 
         // Update inventory from exchange position for accuracy
         self.sync_inventory_from_exchange().await;
 
-        // Only hedge if net_exposure (in USD) exceeds equity * hedge_threshold_ratio.
-        // Below threshold, inventory skew handles rebalancing naturally,
-        // preserving spread revenue. Hedge is insurance for large moves only.
-        let net_exposure = self.inventory + self.hedge_position;
-        let mid = self.last_mid.unwrap_or(0.0);
-        if mid <= 0.0 {
-            return;
-        }
-        let exposure_usd = net_exposure.abs() * mid;
-        let equity = self.equity_cache + self.hedge_equity_cache;
-        let hedge_threshold_usd = equity * self.cfg.hedge_threshold_ratio;
-
-        if exposure_usd <= hedge_threshold_usd {
-            log::debug!(
-                "[HEDGE-RT] exposure=${:.2} within threshold=${:.2} ({:.0}% of equity), skipping",
-                exposure_usd,
-                hedge_threshold_usd,
-                self.cfg.hedge_threshold_ratio * 100.0
-            );
-            return;
-        }
-
-        // Hedge only the excess beyond threshold, keeping some inventory for spread revenue
-        let excess_usd = exposure_usd - hedge_threshold_usd;
-        let excess_tokens = excess_usd / mid;
-        let hedge_conn = self.hedge_conn.as_ref().unwrap().clone();
-        let hedge_side = if net_exposure > 0.0 {
-            OrderSide::Short
-        } else {
-            OrderSide::Long
-        };
-        let hedge_size = self.round_size(excess_tokens);
-        if hedge_size <= Decimal::ZERO {
-            return;
-        }
-
         log::info!(
-            "[HEDGE-RT] Instant hedge: exposure=${:.2} threshold=${:.2} excess=${:.2} side={:?} size={}",
-            exposure_usd,
-            hedge_threshold_usd,
-            excess_usd,
-            hedge_side,
-            hedge_size
+            "[FILL-RT] Fill detected (delta={:+.6}), triggering immediate rebalance",
+            fill_delta
         );
 
-        match hedge_conn
-            .create_order(&self.cfg.symbol, hedge_size, hedge_side, None, None, false, None)
-            .await
-        {
-            Ok(_) => {
-                log::info!("[HEDGE-RT] Instant hedge placed: {:?} size={}", hedge_side, hedge_size);
-                self.sync_inventory_from_exchange().await;
-            }
-            Err(e) => {
-                log::error!("[HEDGE-RT] Failed to place instant hedge: {:?}", e);
+        // Hedge if enabled and exposure exceeds threshold
+        if self.cfg.hedge_enabled && self.hedge_conn.is_some() {
+            let net_exposure = self.inventory + self.hedge_position;
+            let mid = self.last_mid.unwrap_or(0.0);
+            if mid > 0.0 {
+                let exposure_usd = net_exposure.abs() * mid;
+                let equity = self.equity_cache + self.hedge_equity_cache;
+                let hedge_threshold_usd = equity * self.cfg.hedge_threshold_ratio;
+
+                if exposure_usd > hedge_threshold_usd {
+                    let excess_usd = exposure_usd - hedge_threshold_usd;
+                    let excess_tokens = excess_usd / mid;
+                    let hedge_conn = self.hedge_conn.as_ref().unwrap().clone();
+                    let hedge_side = if net_exposure > 0.0 {
+                        OrderSide::Short
+                    } else {
+                        OrderSide::Long
+                    };
+                    let hedge_size = self.round_size(excess_tokens);
+                    if hedge_size > Decimal::ZERO {
+                        log::info!(
+                            "[HEDGE-RT] Instant hedge: exposure=${:.2} threshold=${:.2} excess=${:.2} side={:?} size={}",
+                            exposure_usd,
+                            hedge_threshold_usd,
+                            excess_usd,
+                            hedge_side,
+                            hedge_size
+                        );
+                        match hedge_conn
+                            .create_order(&self.cfg.symbol, hedge_size, hedge_side, None, None, false, None)
+                            .await
+                        {
+                            Ok(_) => {
+                                log::info!("[HEDGE-RT] Instant hedge placed: {:?} size={}", hedge_side, hedge_size);
+                                self.sync_inventory_from_exchange().await;
+                            }
+                            Err(e) => {
+                                log::error!("[HEDGE-RT] Failed to place instant hedge: {:?}", e);
+                            }
+                        }
+                    }
+                }
             }
         }
+
+        true // fills detected → trigger rebalance
     }
 
     // -----------------------------------------------------------------------

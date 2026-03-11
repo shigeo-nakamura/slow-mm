@@ -2,12 +2,12 @@ symbol: BTC
 dry_run: false
 
 # Timing
-interval_secs: 30
+interval_secs: 60
 
 # Spread / quoting
 spread_bps: 4
 order_size_pct: 0.02       # 2% of equity per order level
-order_levels: 1
+order_levels: 2
 level_spacing_bps: 5
 ob_depth: 5
 ob_imbalance_factor: 1.0       # shift spread based on bid/ask depth imbalance
