@@ -7,15 +7,15 @@ interval_secs: 30
 # Spread / quoting
 spread_bps: 4
 order_size_pct: 0.02       # 2% of equity per order level
-order_levels: 3
+order_levels: 1
 level_spacing_bps: 5
 ob_depth: 5
 ob_imbalance_factor: 1.0       # shift spread based on bid/ask depth imbalance
 funding_rate_factor: 1.0       # bias skew toward FR-favorable side
 
 # Inventory management
-max_inventory_pct: 0.10    # 10% of equity as max unhedged inventory
-skew_factor: 3.0
+max_inventory_pct: 0.05    # 5% of equity as max unhedged inventory
+skew_factor: 5.0
 inventory_hard_limit_mult: 2.0
 force_close_mult: 1.5          # market-order close when inv > hard_limit * 1.5
 force_close_cooldown_secs: 120 # min seconds between force-close actions
