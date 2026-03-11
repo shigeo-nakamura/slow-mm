@@ -849,6 +849,10 @@ impl MmEngine {
         let mut new_ask_ids = Vec::new();
 
         // Place bid orders (buy side)
+        // Clamp to best_bid: never bid above current best_bid (queue behind existing orders)
+        let best_bid_dec = self.round_price(best_bid);
+        let best_ask_dec = self.round_price(best_ask);
+
         if quote_bid {
             for level in 0..self.cfg.order_levels {
                 let level_extra_bps = level as f64 * self.cfg.level_spacing_bps;
@@ -859,7 +863,18 @@ impl MmEngine {
                     continue;
                 }
 
-                let bid_price_dec = self.round_price(bid_price);
+                let mut bid_price_dec = self.round_price(bid_price);
+
+                // Clamp: never bid above best_bid to avoid crossing the spread
+                // and to queue behind informed flow
+                if bid_price_dec > best_bid_dec {
+                    log::debug!(
+                        "[MM] BID L{} clamped {} → {} (best_bid)",
+                        level, bid_price_dec, best_bid_dec
+                    );
+                    bid_price_dec = best_bid_dec;
+                }
+
                 let size_dec = self.round_size(order_size_tokens);
 
                 if size_dec <= Decimal::ZERO || bid_price_dec <= Decimal::ZERO {
@@ -912,7 +927,18 @@ impl MmEngine {
                     continue;
                 }
 
-                let ask_price_dec = self.round_price(ask_price);
+                let mut ask_price_dec = self.round_price(ask_price);
+
+                // Clamp: never ask below best_ask to avoid crossing the spread
+                // and to queue behind informed flow
+                if ask_price_dec < best_ask_dec {
+                    log::debug!(
+                        "[MM] ASK L{} clamped {} → {} (best_ask)",
+                        level, ask_price_dec, best_ask_dec
+                    );
+                    ask_price_dec = best_ask_dec;
+                }
+
                 let size_dec = self.round_size(order_size_tokens);
 
                 if size_dec <= Decimal::ZERO || ask_price_dec <= Decimal::ZERO {
