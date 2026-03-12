@@ -18,7 +18,7 @@ funding_rate_factor: 1.0      # bias skew toward FR-favorable side
 
 # Inventory management
 max_inventory_pct: 0.05       # 5% of equity as max unhedged inventory
-skew_factor: 5.0              # strong skew to reduce inventory quickly
+skew_factor: 2.0              # moderate skew (5.0 was too aggressive for LIT)
 inventory_hard_limit_mult: 2.0
 force_close_mult: 1.5         # market-order close when inv > hard_limit * 1.5
 force_close_cooldown_secs: 120
@@ -38,7 +38,7 @@ trend_strength_threshold: 10.0  # raised from 5 — LIT is noisier, avoid over-p
 aggressive_unwind_bps: 2.0      # unwind at entry ± 2bps (tighter than spread)
 post_fill_spread_mult: 2.0      # widen spread after fill to avoid adverse selection
 post_fill_decay_secs: 30
-inventory_spread_mult: 1.5      # widen spread more when holding inventory (was 1.0)
+inventory_spread_mult: 0.5      # mild spread widening with inventory (1.5 was too much)
 
 # Hedge (sub-account)
 hedge_enabled: false
