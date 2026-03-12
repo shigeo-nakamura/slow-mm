@@ -803,24 +803,35 @@ impl MmEngine {
                 unwind_side, self.inventory
             );
         } else if trend_bps.abs() > self.cfg.trend_threshold_bps {
-            // Moderate trend (legacy) — pause only the position-increasing side
-            if trend_bps > 0.0 {
-                // Rising → pause BID (stop buying)
+            // Moderate trend — pause position-increasing side only,
+            // always allow position-reducing (unwind) side.
+            // Same principle as strong trend: base on inventory, not trend direction.
+            if self.inventory > 0.0 {
+                // Long: pause BID (don't add), allow ASK (unwind)
                 trend_pause_bid = true;
-                log::info!("[MM] Moderate trend UP {:.1}bps: pausing BID (inv={:.6})",
+                log::info!("[MM] Moderate trend {:.1}bps: pausing BID (long inv={:.6})",
+                    trend_bps, self.inventory);
+            } else if self.inventory < 0.0 {
+                // Short: pause ASK (don't add), allow BID (unwind)
+                trend_pause_ask = true;
+                log::info!("[MM] Moderate trend {:.1}bps: pausing ASK (short inv={:.6})",
                     trend_bps, self.inventory);
             } else {
-                // Falling → pause ASK (stop selling)
-                trend_pause_ask = true;
-                log::info!("[MM] Moderate trend DOWN {:.1}bps: pausing ASK (inv={:.6})",
-                    trend_bps.abs(), self.inventory);
+                // Flat: pause the side that follows trend to avoid opening into momentum
+                if trend_bps > 0.0 {
+                    trend_pause_bid = true;
+                } else {
+                    trend_pause_ask = true;
+                }
+                log::info!("[MM] Moderate trend {:.1}bps: pausing momentum side (flat)",
+                    trend_bps);
             }
         }
 
         // 8. Compute skew based on inventory
         let inv_skew_bps = self.compute_skew_bps(max_inventory_tokens);
 
-        // 8a. OB imbalance shift: if bids are thicker, price likely to rise → shift ask closer
+        // 8a. OB imbalance shift: if bids thicker, price likely to rise → raise bid (more aggressive buy)
         let ob_shift_bps = if self.cfg.ob_imbalance_factor != 0.0 {
             let bid_depth: f64 = ob
                 .bids
@@ -869,8 +880,9 @@ impl MmEngine {
         let skew_bps = inv_skew_bps + ob_shift_bps + fr_skew_bps;
 
         let half_spread_bps = effective_spread_bps / 2.0;
-        let bid_offset_bps = half_spread_bps * inv_spread_bid_mult + skew_bps;
-        let ask_offset_bps = half_spread_bps * inv_spread_ask_mult - skew_bps;
+        // Clamp offsets to >= 0 to prevent crossing mid (placing bid above mid or ask below mid)
+        let bid_offset_bps = (half_spread_bps * inv_spread_bid_mult + skew_bps).max(0.0);
+        let ask_offset_bps = (half_spread_bps * inv_spread_ask_mult - skew_bps).max(0.0);
 
         // 9. Determine if we should quote on each side
         let hard_limit = max_inventory_tokens * self.cfg.inventory_hard_limit_mult;
