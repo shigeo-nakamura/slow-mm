@@ -3,7 +3,7 @@ dry_run: false
 strategy_mode: passive_mm
 
 # Timing
-interval_secs: 30             # 30s cycle — LIT moves fast, need frequent requotes
+interval_secs: 10             # 10s cycle — LIT moves fast, need frequent requotes
 
 # Spread / quoting
 spread_bps: 15                # LIT native spread 5-30bps; 15bps base = ~7.5bps each side
