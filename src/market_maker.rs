@@ -470,6 +470,8 @@ pub struct MmEngine {
     inventory: f64,
     /// Current hedge position size on hedge account (signed)
     hedge_position: f64,
+    /// Initial spot LIT balance at startup (to compute hedge delta)
+    initial_spot_lit_balance: Option<f64>,
     /// Recent mid prices for volatility estimation
     mid_prices: Vec<f64>,
     /// Track active order IDs on main account
@@ -573,6 +575,7 @@ impl MmEngine {
             last_equity_fetch: None,
             inventory: 0.0,
             hedge_position: 0.0,
+            initial_spot_lit_balance: None,
             mid_prices: Vec::new(),
             active_bid_ids: Vec::new(),
             active_ask_ids: Vec::new(),
@@ -1867,26 +1870,55 @@ impl MmEngine {
             }
         }
 
-        // Sync hedge position (only for legacy sub-account hedge, NOT spot hedge)
-        // Spot hedge tracks position via fill accumulation (hedge_position field)
-        // because spot "positions" are token balances, not perp positions.
-        if self.cfg.spot_hedge_symbol.is_empty() {
-            if let Some(ref hedge) = self.hedge_conn {
-                match hedge.get_positions().await {
-                    Ok(positions) => {
-                        let pos = positions
-                            .iter()
-                            .find(|p| p.symbol == self.cfg.symbol && p.size > Decimal::ZERO);
-                        if let Some(p) = pos {
-                            let size_f = p.size.to_f64().unwrap_or(0.0);
-                            self.hedge_position = if p.sign > 0 { size_f } else { -size_f };
-                        } else {
-                            self.hedge_position = 0.0;
+        // Sync hedge position
+        if !self.cfg.spot_hedge_symbol.is_empty() {
+            // Spot hedge: derive hedge_position from actual LIT balance on exchange
+            // hedge_position = current_LIT_balance - initial_LIT_balance
+            // positive = holding more LIT (hedged short perp), negative = sold LIT (hedged long perp)
+            let base_token = self.cfg.spot_hedge_symbol.split('/').next().unwrap_or("").to_string();
+            if !base_token.is_empty() {
+                match self.main_conn.get_combined_balance().await {
+                    Ok(combined) => {
+                        let current_lit = combined.spot_assets.iter()
+                            .find(|a| a.symbol == base_token)
+                            .map(|a| a.balance.to_f64().unwrap_or(0.0))
+                            .unwrap_or(0.0);
+                        // Record initial balance on first sync
+                        if self.initial_spot_lit_balance.is_none() {
+                            self.initial_spot_lit_balance = Some(current_lit);
+                            log::info!("[SPOT-HEDGE] Initial {} balance: {:.2}", base_token, current_lit);
+                        }
+                        let initial = self.initial_spot_lit_balance.unwrap_or(0.0);
+                        let old_hp = self.hedge_position;
+                        self.hedge_position = current_lit - initial;
+                        if (old_hp - self.hedge_position).abs() > 0.01 {
+                            log::info!(
+                                "[SPOT-HEDGE] Synced: {} balance={:.2} initial={:.2} hedge_pos={:.2} (was {:.2})",
+                                base_token, current_lit, initial, self.hedge_position, old_hp
+                            );
                         }
                     }
                     Err(e) => {
-                        log::warn!("[MM] Failed to get hedge positions: {:?}", e);
+                        log::warn!("[SPOT-HEDGE] Failed to get combined balance for sync: {:?}", e);
                     }
+                }
+            }
+        } else if let Some(ref hedge) = self.hedge_conn {
+            // Legacy sub-account hedge
+            match hedge.get_positions().await {
+                Ok(positions) => {
+                    let pos = positions
+                        .iter()
+                        .find(|p| p.symbol == self.cfg.symbol && p.size > Decimal::ZERO);
+                    if let Some(p) = pos {
+                        let size_f = p.size.to_f64().unwrap_or(0.0);
+                        self.hedge_position = if p.sign > 0 { size_f } else { -size_f };
+                    } else {
+                        self.hedge_position = 0.0;
+                    }
+                }
+                Err(e) => {
+                    log::warn!("[MM] Failed to get hedge positions: {:?}", e);
                 }
             }
         }
@@ -2192,8 +2224,8 @@ impl MmEngine {
             // Check net exposure AFTER inventory sync (inventory updated above)
             let net_exposure = self.inventory + self.hedge_position;
             let mid = self.last_mid.unwrap_or(0.0);
-            // Hedge when net exposure exceeds 50% of max_inventory (batch small fills)
-            let hedge_threshold = self.cached_max_inv * 0.5;
+            // Hedge when net exposure exceeds 10% of max_inventory
+            let hedge_threshold = self.cached_max_inv * 0.1;
             if net_exposure.abs() > hedge_threshold && mid > 0.0 {
                 let hedge_side = if net_exposure > 0.0 {
                     OrderSide::Short // net long → sell spot
@@ -2213,8 +2245,9 @@ impl MmEngine {
                     {
                         Ok(_) => {
                             log::info!("[SPOT-HEDGE-RT] Placed: {:?} size={}", hedge_side, hedge_size);
-                            // Update hedge_position to reflect the hedge
-                            self.hedge_position -= net_exposure; // zero out net exposure
+                            // Re-sync hedge_position from actual spot balance
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            self.sync_inventory_from_exchange().await;
                         }
                         Err(e) => {
                             log::error!("[SPOT-HEDGE-RT] Failed: {:?}", e);
