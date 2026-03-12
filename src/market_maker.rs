@@ -928,22 +928,58 @@ impl MmEngine {
         };
 
         log::info!(
-            "[CAPTURE] {:?} FILLED: size={:.6} price={:.2}, waiting for other side @ {:.2}",
+            "[CAPTURE] {:?} FILLED: size={:.6} price={:.6}, requoting other side immediately (was @ {:.6})",
             side, total_size, fill_price, other_price
         );
 
-        // Don't cancel the other order - let it fill!
+        // Cancel the other order and immediately requote at current best price
+        let _ = self.main_conn.cancel_all_orders(Some(self.cfg.symbol.clone())).await;
+
+        let ob = self.main_conn.get_order_book(&self.cfg.symbol, self.cfg.ob_depth).await;
+        let new_other_price = match ob {
+            Ok(ref ob_snap) => {
+                let (close_side_price, close_side) = match side {
+                    OrderSide::Long => {
+                        let p = ob_snap.asks.first().map(|l| l.price.to_f64().unwrap_or(0.0)).unwrap_or(0.0);
+                        (p, OrderSide::Short)
+                    }
+                    OrderSide::Short => {
+                        let p = ob_snap.bids.first().map(|l| l.price.to_f64().unwrap_or(0.0)).unwrap_or(0.0);
+                        (p, OrderSide::Long)
+                    }
+                };
+                if close_side_price > 0.0 {
+                    let price_dec = self.round_price(close_side_price);
+                    let size_dec = self.round_size(size);
+                    if price_dec > Decimal::ZERO && size_dec > Decimal::ZERO {
+                        log::info!(
+                            "[CAPTURE] Immediate requote: {:?}@{} (entry {:?}@{:.6})",
+                            close_side, price_dec, side, fill_price
+                        );
+                        let _ = self.main_conn.create_order(
+                            &self.cfg.symbol, size_dec, close_side,
+                            Some(price_dec), Some(0), true, Some(self.cfg.stale_order_secs),
+                        ).await;
+                    }
+                    close_side_price
+                } else {
+                    other_price
+                }
+            }
+            Err(_) => other_price,
+        };
+
         let now = Instant::now();
         self.capture_state.phase = CapturePhase::OneFilled {
-            remaining_order_id: String::new(), // not tracking individual IDs
+            remaining_order_id: String::new(),
             filled_side: side,
             filled_price: fill_price,
             filled_size: total_size,
-            other_price,
-            other_size,
+            other_price: new_other_price,
+            other_size: size,
             filled_at: now,
             last_requote_at: now,
-            requote_count: 0,
+            requote_count: 1, // already did first requote
         };
         Ok(())
     }
@@ -989,7 +1025,7 @@ impl MmEngine {
         self.capture_state.capture_pnl += pnl;
 
         log::info!(
-            "[CAPTURE] Round-trip #{}: {:?}@{:.2} + close@{:.2}, pnl=${:.4}, total=${:.4}, inv={:.6}",
+            "[CAPTURE] Round-trip #{}: {:?}@{:.6} + close@{:.6}, pnl=${:.4}, total=${:.4}, inv={:.6}",
             self.capture_state.captures, filled_side, filled_price, close_price,
             pnl, self.capture_state.capture_pnl, self.inventory
         );
@@ -1042,7 +1078,7 @@ impl MmEngine {
 
         let new_count = requote_count + 1;
         log::info!(
-            "[CAPTURE] Requote #{}: {:?}@{} (entry {:?}@{:.2}, elapsed {}s)",
+            "[CAPTURE] Requote #{}: {:?}@{} (entry {:?}@{:.6}, elapsed {}s)",
             new_count, close_side, close_price_dec, filled_side, filled_price,
             filled_at.elapsed().as_secs()
         );
@@ -1097,7 +1133,7 @@ impl MmEngine {
         }
 
         log::warn!(
-            "[CAPTURE] Force closing: market {:?} size={} (open {:?}@{:.2}, target was {:.2})",
+            "[CAPTURE] Force closing: market {:?} size={} (open {:?}@{:.6}, target was {:.6})",
             close_side, size_dec, filled_side, filled_price, other_price
         );
 
@@ -1801,11 +1837,11 @@ impl MmEngine {
                     match fill.filled_side {
                         Some(OrderSide::Long) => {
                             self.total_bid_fills += 1;
-                            log::info!("[FILL] LONG size={:.6} price={:.2}", size, fill_price);
+                            log::info!("[FILL] LONG size={:.6} price={:.6}", size, fill_price);
                         }
                         _ => {
                             self.total_ask_fills += 1;
-                            log::info!("[FILL] SHORT size={:.6} price={:.2}", size, fill_price);
+                            log::info!("[FILL] SHORT size={:.6} price={:.6}", size, fill_price);
                         }
                     }
 
@@ -2037,12 +2073,12 @@ impl MmEngine {
                 Some(OrderSide::Long) => {
                     fill_delta += size;
                     self.total_bid_fills += 1;
-                    log::info!("[FILL-RT] LONG size={:.6} price={:.2}", size, fill_price);
+                    log::info!("[FILL-RT] LONG size={:.6} price={:.6}", size, fill_price);
                 }
                 _ => {
                     fill_delta -= size;
                     self.total_ask_fills += 1;
-                    log::info!("[FILL-RT] SHORT size={:.6} price={:.2}", size, fill_price);
+                    log::info!("[FILL-RT] SHORT size={:.6} price={:.6}", size, fill_price);
                 }
             }
             self.total_trades += 1;
