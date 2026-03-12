@@ -743,7 +743,18 @@ impl MmEngine {
                 }
                 Ok(())
             }
+        }?;
+
+        // Update dashboard status
+        if self.status_reporter.is_some() {
+            let positions = self.build_position_info().await;
+            let reporter = self.status_reporter.as_mut().unwrap();
+            reporter.update_equity(self.equity_cache);
+            if let Err(err) = reporter.write_snapshot_if_due(&positions) {
+                log::warn!("[STATUS] failed to write status: {:?}", err);
+            }
         }
+        Ok(())
     }
 
     /// Scan OB, place both bid and ask Post-Only orders if spread is wide enough
