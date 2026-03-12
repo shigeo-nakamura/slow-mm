@@ -775,22 +775,23 @@ impl MmEngine {
         let mut trend_pause_ask = false;
 
         if ema_trend_bps.abs() > self.cfg.trend_strength_threshold {
-            // Strong trend detected — pause position-increasing side
-            // BUT always allow position-reducing side to unwind inventory
-            if ema_trend_bps > 0.0 {
-                // Trend UP → pause BID (don't go long into up-trend as taker)
-                // Allow ASK if long (to reduce), pause ASK if flat/short (don't initiate short)
+            // Strong trend detected — pause new-position side,
+            // BUT always allow the position-reducing (unwind) side.
+            //
+            // Unwind side depends on INVENTORY, not trend direction:
+            //   long  (inv>0) → unwind via ASK (sell)
+            //   short (inv<0) → unwind via BID (buy)
+            //   flat  (inv=0) → nothing to unwind, pause both
+            if self.inventory > 0.0 {
+                // Long position: always allow ASK to unwind, pause BID
                 trend_pause_bid = true;
-                if self.inventory <= 0.0 {
-                    trend_pause_ask = true; // no position to unwind, pause both
-                }
-            } else {
-                // Trend DOWN → pause ASK (don't go short into down-trend)
-                // Allow BID if short (to reduce), pause BID if flat/long (don't initiate long)
+            } else if self.inventory < 0.0 {
+                // Short position: always allow BID to unwind, pause ASK
                 trend_pause_ask = true;
-                if self.inventory >= 0.0 {
-                    trend_pause_bid = true; // no position to unwind, pause both
-                }
+            } else {
+                // Flat: pause both to avoid opening new positions in trend
+                trend_pause_bid = true;
+                trend_pause_ask = true;
             }
             let direction = if ema_trend_bps > 0.0 { "UP" } else { "DOWN" };
             let unwind_side = if self.inventory > 0.0 { "ASK(unwind)" }
