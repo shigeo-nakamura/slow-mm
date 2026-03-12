@@ -1801,22 +1801,34 @@ impl MmEngine {
         }
         // Also refresh hedge/spot equity
         if !self.cfg.spot_hedge_symbol.is_empty() {
-            // Spot hedge: use total_asset_value from Lighter API (perp + spot combined)
-            match self.main_conn.get_combined_balance().await {
-                Ok(combined) => {
-                    let total = combined.total_asset_value.to_f64().unwrap_or(0.0);
-                    if total > 0.0 {
-                        // total_asset_value = perp + spot. Spot equity = total - perp.
-                        let spot_equity = (total - self.equity_cache).max(0.0);
+            // Spot hedge: compute spot equity from LIT token balance × mid price
+            let base_token = self.cfg.spot_hedge_symbol.split('/').next().unwrap_or("");
+            let mid = self.last_mid.unwrap_or(0.0);
+            if !base_token.is_empty() && mid > 0.0 {
+                match self.main_conn.get_combined_balance().await {
+                    Ok(combined) => {
+                        let mut spot_equity = 0.0;
+                        for asset in &combined.spot_assets {
+                            let bal = asset.balance.to_f64().unwrap_or(0.0);
+                            if asset.symbol == "USDC" || asset.symbol == "USDT" {
+                                spot_equity += bal;
+                            } else if asset.symbol == base_token {
+                                spot_equity += bal * mid;
+                            }
+                            // skip unknown tokens
+                        }
                         self.hedge_equity_cache = spot_equity;
                         log::debug!(
-                            "[MM] Total asset value: {:.2}, perp: {:.2}, spot: {:.2}",
-                            total, self.equity_cache, spot_equity
+                            "[MM] Spot equity: ${:.2} (assets: {:?})",
+                            spot_equity,
+                            combined.spot_assets.iter()
+                                .map(|a| format!("{}={:.2}", a.symbol, a.balance.to_f64().unwrap_or(0.0)))
+                                .collect::<Vec<_>>()
                         );
                     }
-                }
-                Err(e) => {
-                    log::warn!("[MM] Failed to get combined balance: {:?}", e);
+                    Err(e) => {
+                        log::warn!("[MM] Failed to get combined balance: {:?}", e);
+                    }
                 }
             }
         } else if let Some(ref hedge) = self.hedge_conn {
