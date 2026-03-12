@@ -831,14 +831,14 @@ impl MmEngine {
         }
 
         log::info!(
-            "[CAPTURE] spread={:.1}bps, placing BOTH: Long@{} + Short@{} size={}",
+            "[CAPTURE] spread={:.1}bps, placing BOTH GTT: Long@{} + Short@{} size={}",
             spread_bps, bid_price_dec, ask_price_dec, size_dec
         );
 
         // Place bid (Long) Post-Only
         let bid_result = self.main_conn.create_order(
             &self.cfg.symbol, size_dec, OrderSide::Long,
-            Some(bid_price_dec), Some(-2), false, Some(self.cfg.stale_order_secs),
+            Some(bid_price_dec), Some(0), false, Some(self.cfg.stale_order_secs),
         ).await;
 
         let bid_order_id = match bid_result {
@@ -852,7 +852,7 @@ impl MmEngine {
         // Place ask (Short) Post-Only
         let ask_result = self.main_conn.create_order(
             &self.cfg.symbol, size_dec, OrderSide::Short,
-            Some(ask_price_dec), Some(-2), false, Some(self.cfg.stale_order_secs),
+            Some(ask_price_dec), Some(0), false, Some(self.cfg.stale_order_secs),
         ).await;
 
         let ask_order_id = match ask_result {
