@@ -1,42 +1,42 @@
 symbol: LIT
 dry_run: false
-strategy_mode: reactive_capture
+strategy_mode: passive_mm
 
 # Timing
-interval_secs: 60
+interval_secs: 30             # 30s cycle — LIT moves fast, need frequent requotes
 
 # Spread / quoting
-spread_bps: 3
-order_size_pct: 0.02       # 2% of equity per order level
-order_levels: 1
-level_spacing_bps: 5
+spread_bps: 15                # LIT native spread 5-30bps; 15bps base = ~7.5bps each side
+order_size_pct: 0.02          # 2% of equity per order level
+order_levels: 2               # 2 levels each side for better fill probability
+level_spacing_bps: 10         # 2nd level 10bps deeper
 ob_depth: 5
-ob_imbalance_factor: 1.0       # shift spread based on bid/ask depth imbalance
-funding_rate_factor: 1.0       # bias skew toward FR-favorable side
+ob_imbalance_factor: 1.0      # shift spread based on bid/ask depth imbalance
+funding_rate_factor: 1.0      # bias skew toward FR-favorable side
 
 # Inventory management
-max_inventory_pct: 0.05    # 5% of equity as max unhedged inventory
-skew_factor: 5.0
+max_inventory_pct: 0.05       # 5% of equity as max unhedged inventory
+skew_factor: 5.0              # strong skew to reduce inventory quickly
 inventory_hard_limit_mult: 2.0
-force_close_mult: 1.5          # market-order close when inv > hard_limit * 1.5
-force_close_cooldown_secs: 120 # min seconds between force-close actions
+force_close_mult: 1.5         # market-order close when inv > hard_limit * 1.5
+force_close_cooldown_secs: 120
 
 # Volatility-adaptive spread
 volatility_window: 60
-volatility_spread_mult: 0.5
-min_spread_bps: 2
-max_spread_bps: 50
+volatility_spread_mult: 1.0   # widen spread more aggressively with vol (was 0.5)
+min_spread_bps: 5             # never go below 5bps (LIT has thin book)
+max_spread_bps: 80            # allow wider spread in volatile periods
 
 # Adverse selection protection
-trend_window: 10               # mid samples for trend detection (10 × 60s = 10min)
-trend_threshold_bps: 3.0       # legacy: pause one side if exceeded
-ema_short_periods: 5           # EMA short period (~5 min with 60s interval)
-ema_long_periods: 20           # EMA long period (~20 min with 60s interval)
-trend_strength_threshold: 5.0  # bps: pause BOTH sides when |EMA_short - EMA_long| exceeds this
-aggressive_unwind_bps: 1.0     # unwind at entry ± 1bps (min ~$7 profit per round-trip)
-post_fill_spread_mult: 2.0     # spread multiplier right after fill (decays)
-post_fill_decay_secs: 30       # seconds for post-fill boost to decay
-inventory_spread_mult: 1.0     # spread widens proportional to |inventory|
+trend_window: 10
+trend_threshold_bps: 3.0
+ema_short_periods: 5
+ema_long_periods: 20
+trend_strength_threshold: 10.0  # raised from 5 — LIT is noisier, avoid over-pausing
+aggressive_unwind_bps: 2.0      # unwind at entry ± 2bps (tighter than spread)
+post_fill_spread_mult: 2.0      # widen spread after fill to avoid adverse selection
+post_fill_decay_secs: 30
+inventory_spread_mult: 1.5      # widen spread more when holding inventory (was 1.0)
 
 # Hedge (sub-account)
 hedge_enabled: false
@@ -47,9 +47,3 @@ hedge_close_threshold_ratio: 0.1
 max_leverage: 20
 equity_usd_fallback: 500
 stale_order_secs: 300
-
-# Reactive spread capture
-capture_min_spread_bps: 5
-capture_close_timeout_secs: 30
-capture_scan_interval_secs: 3      # OB scan every 3s (WS cache, no REST)
-capture_poll_interval_secs: 2      # fill check every 2s when order active
