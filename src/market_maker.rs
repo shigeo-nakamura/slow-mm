@@ -104,6 +104,7 @@ struct MmYaml {
     capture_poll_interval_secs: Option<u64>,
     price_decimals: Option<u32>,
     size_decimals: Option<u32>,
+    spot_hedge_symbol: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +188,8 @@ pub struct MmConfig {
     pub price_decimals: u32,
     /// Decimal places for size rounding (e.g. 5 for BTC 0.00100, 2 for LIT 209.42)
     pub size_decimals: u32,
+    /// Spot symbol for delta-neutral hedging (e.g. "LIT/USDC"). Empty = disabled.
+    pub spot_hedge_symbol: String,
 }
 
 impl MmConfig {
@@ -289,6 +292,7 @@ impl MmConfig {
                 .unwrap_or(DEFAULT_CAPTURE_POLL_INTERVAL_SECS),
             price_decimals: yaml.price_decimals.unwrap_or(DEFAULT_PRICE_DECIMALS),
             size_decimals: yaml.size_decimals.unwrap_or(DEFAULT_SIZE_DECIMALS),
+            spot_hedge_symbol: yaml.spot_hedge_symbol.unwrap_or_default(),
         };
         cfg.apply_env_overrides();
         Ok(cfg)
@@ -386,6 +390,7 @@ impl MmConfig {
             ),
             price_decimals: parse_env("PRICE_DECIMALS", DEFAULT_PRICE_DECIMALS),
             size_decimals: parse_env("SIZE_DECIMALS", DEFAULT_SIZE_DECIMALS),
+            spot_hedge_symbol: env::var("SPOT_HEDGE_SYMBOL").unwrap_or_default(),
         };
         cfg.apply_env_overrides();
         Ok(cfg)
@@ -520,17 +525,31 @@ impl MmEngine {
             log::warn!("[INIT] Failed to set leverage on main: {:?}", e);
         }
 
-        // Create hedge connector if enabled
-        let hedge_conn = if cfg.hedge_enabled {
-            match DexConnectorBox::create_lighter("HEDGE_", cfg.dry_run, &tokens).await {
+        // Create hedge connector if enabled (spot hedge or sub-account hedge)
+        let use_spot_hedge = !cfg.spot_hedge_symbol.is_empty();
+        let hedge_conn = if cfg.hedge_enabled || use_spot_hedge {
+            let hedge_tokens = if use_spot_hedge {
+                vec![cfg.spot_hedge_symbol.clone()]
+            } else {
+                tokens.clone()
+            };
+            // Spot hedge uses same account (no HEDGE_ prefix), sub-account hedge uses HEDGE_ prefix
+            let prefix = if use_spot_hedge { "" } else { "HEDGE_" };
+            match DexConnectorBox::create_lighter(prefix, cfg.dry_run, &hedge_tokens).await {
                 Ok(hc) => {
                     if let Err(e) = hc.start().await {
                         log::error!("[INIT] Failed to start hedge connector: {:?}", e);
                         None
                     } else {
-                        if let Err(e) = hc.set_leverage(&cfg.symbol, cfg.max_leverage).await {
-                            log::warn!("[INIT] Failed to set leverage on hedge: {:?}", e);
+                        if !use_spot_hedge {
+                            if let Err(e) = hc.set_leverage(&cfg.symbol, cfg.max_leverage).await {
+                                log::warn!("[INIT] Failed to set leverage on hedge: {:?}", e);
+                            }
                         }
+                        log::info!(
+                            "[INIT] Hedge connector ready ({})",
+                            if use_spot_hedge { &cfg.spot_hedge_symbol } else { "sub-account" }
+                        );
                         Some(Arc::new(hc) as Arc<dyn DexConnector + Send + Sync>)
                     }
                 }
@@ -1961,79 +1980,109 @@ impl MmEngine {
     // Hedge management
     // -----------------------------------------------------------------------
 
-    /// Safety-net hedge on each step cycle.
-    /// Same threshold logic as instant hedge — equity-normalized USD exposure.
-    /// Also handles closing hedge when exposure returns below close_threshold.
+    /// Hedge management on each step cycle.
+    /// Spot hedge: keep delta-neutral by hedging full perp inventory on spot.
+    /// Sub-account hedge: threshold-based hedging (legacy).
     async fn manage_hedge(&mut self, _max_inventory_tokens: f64, _order_size_tokens: f64) {
         let hedge_conn = match &self.hedge_conn {
             Some(c) => c.clone(),
             None => return,
         };
 
-        let net_exposure = self.inventory + self.hedge_position;
         let mid = self.last_mid.unwrap_or(0.0);
         if mid <= 0.0 {
             return;
         }
-        let exposure_usd = net_exposure.abs() * mid;
-        let equity = self.equity_cache + self.hedge_equity_cache;
-        let hedge_threshold_usd = equity * self.cfg.hedge_threshold_ratio;
-        let close_threshold_usd = equity * self.cfg.hedge_close_threshold_ratio;
 
-        if exposure_usd > hedge_threshold_usd {
-            // Hedge excess beyond threshold
-            let excess_usd = exposure_usd - hedge_threshold_usd;
-            let excess_tokens = excess_usd / mid;
-            let side = if net_exposure > 0.0 {
-                OrderSide::Short
+        let use_spot_hedge = !self.cfg.spot_hedge_symbol.is_empty();
+
+        if use_spot_hedge {
+            // Spot hedge: target = -inventory (opposite of perp position)
+            // hedge_position tracks current spot position (positive = long spot)
+            let target_hedge = -self.inventory; // perp long → spot short, perp short → spot long
+            let delta = target_hedge - self.hedge_position;
+            if delta.abs() < 1.0 {
+                return; // close enough
+            }
+            let side = if delta > 0.0 {
+                OrderSide::Long // need to buy spot
             } else {
-                OrderSide::Long
+                OrderSide::Short // need to sell spot
             };
-            let size = self.round_size(excess_tokens);
+            let size = self.round_size(delta.abs());
             if size <= Decimal::ZERO {
                 return;
             }
             log::info!(
-                "[HEDGE-STEP] exposure=${:.2} threshold=${:.2} excess=${:.2} side={:?} size={}",
-                exposure_usd, hedge_threshold_usd, excess_usd, side, size
+                "[SPOT-HEDGE] inv={:.2} hedge={:.2} target={:.2} delta={:.2} {:?} size={}",
+                self.inventory, self.hedge_position, target_hedge, delta, side, size
             );
             match hedge_conn
-                .create_order(&self.cfg.symbol, size, side, None, None, false, None)
+                .create_order(&self.cfg.spot_hedge_symbol, size, side, None, None, false, None)
                 .await
             {
-                Ok(_) => log::info!("[HEDGE-STEP] Placed: {:?} size={}", side, size),
-                Err(e) => log::error!("[HEDGE-STEP] Failed: {:?}", e),
+                Ok(_) => {
+                    log::info!("[SPOT-HEDGE] Placed: {:?} {} size={}", side, self.cfg.spot_hedge_symbol, size);
+                    // Update hedge position estimate (will be corrected by sync)
+                    self.hedge_position += delta;
+                }
+                Err(e) => log::error!("[SPOT-HEDGE] Failed: {:?}", e),
             }
-        } else if exposure_usd <= close_threshold_usd && self.hedge_position.abs() > 0.0 {
-            // Only close hedge when main inventory has genuinely reduced.
-            // Check if inventory (main only) is small enough that the hedge is no longer needed.
-            let inv_usd = self.inventory.abs() * mid;
-            if inv_usd <= close_threshold_usd {
-                let side = if self.hedge_position > 0.0 {
+        } else {
+            // Legacy sub-account hedge with threshold
+            let net_exposure = self.inventory + self.hedge_position;
+            let exposure_usd = net_exposure.abs() * mid;
+            let equity = self.equity_cache + self.hedge_equity_cache;
+            let hedge_threshold_usd = equity * self.cfg.hedge_threshold_ratio;
+            let close_threshold_usd = equity * self.cfg.hedge_close_threshold_ratio;
+
+            if exposure_usd > hedge_threshold_usd {
+                let excess_usd = exposure_usd - hedge_threshold_usd;
+                let excess_tokens = excess_usd / mid;
+                let side = if net_exposure > 0.0 {
                     OrderSide::Short
                 } else {
                     OrderSide::Long
                 };
-                let size = self.round_size(self.hedge_position.abs());
+                let size = self.round_size(excess_tokens);
                 if size <= Decimal::ZERO {
                     return;
                 }
                 log::info!(
-                    "[HEDGE-STEP] Closing hedge: inv_usd=${:.2} close_threshold=${:.2} side={:?} size={}",
-                    inv_usd, close_threshold_usd, side, size
+                    "[HEDGE-STEP] exposure=${:.2} threshold=${:.2} excess=${:.2} side={:?} size={}",
+                    exposure_usd, hedge_threshold_usd, excess_usd, side, size
                 );
                 match hedge_conn
                     .create_order(&self.cfg.symbol, size, side, None, None, false, None)
                     .await
                 {
-                    Ok(_) => log::info!("[HEDGE-STEP] Hedge closed: {:?} size={}", side, size),
-                    Err(e) => log::error!("[HEDGE-STEP] Failed to close hedge: {:?}", e),
+                    Ok(_) => log::info!("[HEDGE-STEP] Placed: {:?} size={}", side, size),
+                    Err(e) => log::error!("[HEDGE-STEP] Failed: {:?}", e),
                 }
-            } else {
-                log::debug!(
-                    "[HEDGE-STEP] Net exposure low but inventory=${:.2} still above close_threshold=${:.2}, keeping hedge",
-                    inv_usd, close_threshold_usd
-                );
+            } else if exposure_usd <= close_threshold_usd && self.hedge_position.abs() > 0.0 {
+                let inv_usd = self.inventory.abs() * mid;
+                if inv_usd <= close_threshold_usd {
+                    let side = if self.hedge_position > 0.0 {
+                        OrderSide::Short
+                    } else {
+                        OrderSide::Long
+                    };
+                    let size = self.round_size(self.hedge_position.abs());
+                    if size <= Decimal::ZERO {
+                        return;
+                    }
+                    log::info!(
+                        "[HEDGE-STEP] Closing hedge: inv_usd=${:.2} close_threshold=${:.2} side={:?} size={}",
+                        inv_usd, close_threshold_usd, side, size
+                    );
+                    match hedge_conn
+                        .create_order(&self.cfg.symbol, size, side, None, None, false, None)
+                        .await
+                    {
+                        Ok(_) => log::info!("[HEDGE-STEP] Hedge closed: {:?} size={}", side, size),
+                        Err(e) => log::error!("[HEDGE-STEP] Failed to close hedge: {:?}", e),
+                    }
+                }
             }
         }
     }
@@ -2112,44 +2161,72 @@ impl MmEngine {
             fill_delta
         );
 
-        // Hedge if enabled and exposure exceeds threshold
-        if self.cfg.hedge_enabled && self.hedge_conn.is_some() {
-            let net_exposure = self.inventory + self.hedge_position;
-            let mid = self.last_mid.unwrap_or(0.0);
-            if mid > 0.0 {
-                let exposure_usd = net_exposure.abs() * mid;
-                let equity = self.equity_cache + self.hedge_equity_cache;
-                let hedge_threshold_usd = equity * self.cfg.hedge_threshold_ratio;
+        // Instant hedge on fill detection
+        if self.hedge_conn.is_some() {
+            let use_spot_hedge = !self.cfg.spot_hedge_symbol.is_empty();
+            let hedge_conn = self.hedge_conn.as_ref().unwrap().clone();
 
-                if exposure_usd > hedge_threshold_usd {
-                    let excess_usd = exposure_usd - hedge_threshold_usd;
-                    let excess_tokens = excess_usd / mid;
-                    let hedge_conn = self.hedge_conn.as_ref().unwrap().clone();
-                    let hedge_side = if net_exposure > 0.0 {
-                        OrderSide::Short
-                    } else {
-                        OrderSide::Long
-                    };
-                    let hedge_size = self.round_size(excess_tokens);
-                    if hedge_size > Decimal::ZERO {
-                        log::info!(
-                            "[HEDGE-RT] Instant hedge: exposure=${:.2} threshold=${:.2} excess=${:.2} side={:?} size={}",
-                            exposure_usd,
-                            hedge_threshold_usd,
-                            excess_usd,
-                            hedge_side,
-                            hedge_size
-                        );
-                        match hedge_conn
-                            .create_order(&self.cfg.symbol, hedge_size, hedge_side, None, None, false, None)
-                            .await
-                        {
-                            Ok(_) => {
-                                log::info!("[HEDGE-RT] Instant hedge placed: {:?} size={}", hedge_side, hedge_size);
-                                self.sync_inventory_from_exchange().await;
-                            }
-                            Err(e) => {
-                                log::error!("[HEDGE-RT] Failed to place instant hedge: {:?}", e);
+            if use_spot_hedge {
+                // Spot hedge: immediately hedge the fill delta (opposite direction on spot)
+                // Perp Long fill → Spot Short (sell), Perp Short fill → Spot Long (buy)
+                let hedge_side = if fill_delta > 0.0 {
+                    OrderSide::Short // bought perp → sell spot
+                } else {
+                    OrderSide::Long // sold perp → buy spot
+                };
+                let hedge_size = self.round_size(fill_delta.abs());
+                if hedge_size > Decimal::ZERO {
+                    log::info!(
+                        "[SPOT-HEDGE-RT] Perp fill {:+.2} → spot {:?} {} size={}",
+                        fill_delta, hedge_side, self.cfg.spot_hedge_symbol, hedge_size
+                    );
+                    match hedge_conn
+                        .create_order(&self.cfg.spot_hedge_symbol, hedge_size, hedge_side, None, None, false, None)
+                        .await
+                    {
+                        Ok(_) => {
+                            log::info!("[SPOT-HEDGE-RT] Placed: {:?} size={}", hedge_side, hedge_size);
+                            self.hedge_position -= fill_delta; // opposite of perp
+                        }
+                        Err(e) => {
+                            log::error!("[SPOT-HEDGE-RT] Failed: {:?}", e);
+                        }
+                    }
+                }
+            } else if self.cfg.hedge_enabled {
+                // Legacy sub-account hedge with threshold
+                let net_exposure = self.inventory + self.hedge_position;
+                let mid = self.last_mid.unwrap_or(0.0);
+                if mid > 0.0 {
+                    let exposure_usd = net_exposure.abs() * mid;
+                    let equity = self.equity_cache + self.hedge_equity_cache;
+                    let hedge_threshold_usd = equity * self.cfg.hedge_threshold_ratio;
+
+                    if exposure_usd > hedge_threshold_usd {
+                        let excess_usd = exposure_usd - hedge_threshold_usd;
+                        let excess_tokens = excess_usd / mid;
+                        let hedge_side = if net_exposure > 0.0 {
+                            OrderSide::Short
+                        } else {
+                            OrderSide::Long
+                        };
+                        let hedge_size = self.round_size(excess_tokens);
+                        if hedge_size > Decimal::ZERO {
+                            log::info!(
+                                "[HEDGE-RT] Instant hedge: exposure=${:.2} threshold=${:.2} excess=${:.2} side={:?} size={}",
+                                exposure_usd, hedge_threshold_usd, excess_usd, hedge_side, hedge_size
+                            );
+                            match hedge_conn
+                                .create_order(&self.cfg.symbol, hedge_size, hedge_side, None, None, false, None)
+                                .await
+                            {
+                                Ok(_) => {
+                                    log::info!("[HEDGE-RT] Instant hedge placed: {:?} size={}", hedge_side, hedge_size);
+                                    self.sync_inventory_from_exchange().await;
+                                }
+                                Err(e) => {
+                                    log::error!("[HEDGE-RT] Failed to place instant hedge: {:?}", e);
+                                }
                             }
                         }
                     }

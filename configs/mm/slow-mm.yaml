@@ -4,6 +4,9 @@ strategy_mode: passive_mm
 price_decimals: 4              # LIT: $1.1050 (0.0001 tick)
 size_decimals: 2               # LIT: 209.42 (0.01 step)
 
+# Spot hedge: hedge perp inventory on spot to stay delta-neutral
+spot_hedge_symbol: "LIT/USDC"
+
 # Timing
 interval_secs: 10             # 10s cycle — LIT moves fast, need frequent requotes
 
@@ -18,29 +21,29 @@ funding_rate_factor: 1.0      # bias skew toward FR-favorable side
 
 # Inventory management
 max_inventory_pct: 0.05       # 5% of equity as max unhedged inventory
-skew_factor: 2.0              # moderate skew (5.0 was too aggressive for LIT)
+skew_factor: 2.0              # moderate skew
 inventory_hard_limit_mult: 2.0
-force_close_mult: 1.5         # market-order close when inv > hard_limit * 1.5
+force_close_mult: 1.5
 force_close_cooldown_secs: 120
 
 # Volatility-adaptive spread
 volatility_window: 60
-volatility_spread_mult: 1.0   # widen spread more aggressively with vol (was 0.5)
-min_spread_bps: 5             # never go below 5bps (LIT has thin book)
-max_spread_bps: 80            # allow wider spread in volatile periods
+volatility_spread_mult: 1.0
+min_spread_bps: 5
+max_spread_bps: 80
 
 # Adverse selection protection
 trend_window: 10
 trend_threshold_bps: 3.0
 ema_short_periods: 5
 ema_long_periods: 20
-trend_strength_threshold: 10.0  # raised from 5 — LIT is noisier, avoid over-pausing
-aggressive_unwind_bps: 2.0      # unwind at entry ± 2bps (tighter than spread)
-post_fill_spread_mult: 2.0      # widen spread after fill to avoid adverse selection
+trend_strength_threshold: 10.0
+aggressive_unwind_bps: 2.0
+post_fill_spread_mult: 2.0
 post_fill_decay_secs: 30
-inventory_spread_mult: 0.5      # mild spread widening with inventory (1.5 was too much)
+inventory_spread_mult: 0.5
 
-# Hedge (sub-account)
+# Hedge (sub-account) — disabled, using spot hedge instead
 hedge_enabled: false
 hedge_threshold_ratio: 0.2
 hedge_close_threshold_ratio: 0.1
