@@ -1729,9 +1729,9 @@ impl MmEngine {
         self.active_ask_ids = new_ask_ids;
         self.last_order_time = Some(Instant::now());
 
-        // 9. Manage hedge position
-        let use_spot_hedge = !self.cfg.spot_hedge_symbol.is_empty();
-        if use_spot_hedge || (self.cfg.hedge_enabled && self.hedge_conn.is_some()) {
+        // 9. Manage hedge position (legacy sub-account only)
+        // Spot hedge is handled exclusively by check_fills_and_rebalance() to avoid double-firing.
+        if self.cfg.hedge_enabled && self.hedge_conn.is_some() {
             self.manage_hedge(max_inventory_tokens, order_size_tokens).await;
         }
 
@@ -2021,50 +2021,19 @@ impl MmEngine {
     /// Hedge management on each step cycle.
     /// Spot hedge: keep delta-neutral by hedging full perp inventory on spot.
     /// Sub-account hedge: threshold-based hedging (legacy).
+    /// Legacy sub-account hedge only. Spot hedge is handled by check_fills_and_rebalance().
     async fn manage_hedge(&mut self, _max_inventory_tokens: f64, _order_size_tokens: f64) {
+        let hedge_conn = match &self.hedge_conn {
+            Some(c) => c.clone(),
+            None => return,
+        };
+
         let mid = self.last_mid.unwrap_or(0.0);
         if mid <= 0.0 {
             return;
         }
 
-        let use_spot_hedge = !self.cfg.spot_hedge_symbol.is_empty();
-
-        if use_spot_hedge {
-            // Spot hedge via main_conn (single nonce sequence, no conflicts)
-            // hedge_position tracks cumulative spot hedge (negative = sold spot tokens)
-            let target_hedge = -self.inventory; // perp long → spot short, perp short → spot long
-            let delta = target_hedge - self.hedge_position;
-            if delta.abs() < 1.0 {
-                return; // close enough
-            }
-            let side = if delta > 0.0 {
-                OrderSide::Long // need to buy spot
-            } else {
-                OrderSide::Short // need to sell spot
-            };
-            let size = self.round_size(delta.abs());
-            if size <= Decimal::ZERO {
-                return;
-            }
-            log::info!(
-                "[SPOT-HEDGE] inv={:.2} hedge={:.2} target={:.2} delta={:.2} {:?} size={}",
-                self.inventory, self.hedge_position, target_hedge, delta, side, size
-            );
-            match self.main_conn
-                .create_order(&self.cfg.spot_hedge_symbol, size, side, None, None, false, None)
-                .await
-            {
-                Ok(_) => {
-                    log::info!("[SPOT-HEDGE] Placed: {:?} {} size={}", side, self.cfg.spot_hedge_symbol, size);
-                    self.hedge_position += delta;
-                }
-                Err(e) => log::error!("[SPOT-HEDGE] Failed: {:?}", e),
-            }
-        } else {
-            let hedge_conn = match &self.hedge_conn {
-                Some(c) => c.clone(),
-                None => return,
-            };
+        {
             // Legacy sub-account hedge with threshold
             let net_exposure = self.inventory + self.hedge_position;
             let exposure_usd = net_exposure.abs() * mid;
