@@ -964,7 +964,7 @@ impl MmEngine {
         };
 
         // Determine other side's price
-        let (other_price, other_size) = match side {
+        let (other_price, _other_size) = match side {
             OrderSide::Long => (ask_price, size),   // bid filled, waiting for ask
             OrderSide::Short => (bid_price, size),   // ask filled, waiting for bid
         };
@@ -2166,33 +2166,46 @@ impl MmEngine {
             fill_delta
         );
 
-        // Instant hedge on fill detection
+        // Spot hedge on fill detection — hedge only when net_exposure exceeds threshold
         let use_spot_hedge = !self.cfg.spot_hedge_symbol.is_empty();
         if use_spot_hedge {
-            // Spot hedge via main_conn: immediately hedge the fill delta (opposite direction on spot)
-            let hedge_side = if fill_delta > 0.0 {
-                OrderSide::Short // bought perp → sell spot
-            } else {
-                OrderSide::Long // sold perp → buy spot
-            };
-            let hedge_size = self.round_size(fill_delta.abs());
-            if hedge_size > Decimal::ZERO {
-                log::info!(
-                    "[SPOT-HEDGE-RT] Perp fill {:+.2} → spot {:?} {} size={}",
-                    fill_delta, hedge_side, self.cfg.spot_hedge_symbol, hedge_size
-                );
-                match self.main_conn
-                    .create_order(&self.cfg.spot_hedge_symbol, hedge_size, hedge_side, None, None, false, None)
-                    .await
-                {
-                    Ok(_) => {
-                        log::info!("[SPOT-HEDGE-RT] Placed: {:?} size={}", hedge_side, hedge_size);
-                        self.hedge_position -= fill_delta; // opposite of perp
-                    }
-                    Err(e) => {
-                        log::error!("[SPOT-HEDGE-RT] Failed: {:?}", e);
+            // Check net exposure AFTER inventory sync (inventory updated above)
+            let net_exposure = self.inventory + self.hedge_position;
+            let mid = self.last_mid.unwrap_or(0.0);
+            // Hedge when net exposure exceeds 50% of max_inventory (batch small fills)
+            let hedge_threshold = self.cached_max_inv * 0.5;
+            if net_exposure.abs() > hedge_threshold && mid > 0.0 {
+                let hedge_side = if net_exposure > 0.0 {
+                    OrderSide::Short // net long → sell spot
+                } else {
+                    OrderSide::Long // net short → buy spot
+                };
+                let hedge_size = self.round_size(net_exposure.abs());
+                if hedge_size > Decimal::ZERO {
+                    log::info!(
+                        "[SPOT-HEDGE-RT] net_exp={:.2} threshold={:.2} → spot {:?} {} size={}",
+                        net_exposure, hedge_threshold, hedge_side, self.cfg.spot_hedge_symbol, hedge_size
+                    );
+                    // Market order for guaranteed instant fill
+                    match self.main_conn
+                        .create_order(&self.cfg.spot_hedge_symbol, hedge_size, hedge_side, None, None, false, None)
+                        .await
+                    {
+                        Ok(_) => {
+                            log::info!("[SPOT-HEDGE-RT] Placed: {:?} size={}", hedge_side, hedge_size);
+                            // Update hedge_position to reflect the hedge
+                            self.hedge_position -= net_exposure; // zero out net exposure
+                        }
+                        Err(e) => {
+                            log::error!("[SPOT-HEDGE-RT] Failed: {:?}", e);
+                        }
                     }
                 }
+            } else if net_exposure.abs() > 1.0 {
+                log::debug!(
+                    "[SPOT-HEDGE-RT] net_exp={:.2} below threshold={:.2}, deferring hedge",
+                    net_exposure, hedge_threshold
+                );
             }
         } else if self.cfg.hedge_enabled {
             if let Some(ref hedge_conn) = self.hedge_conn {

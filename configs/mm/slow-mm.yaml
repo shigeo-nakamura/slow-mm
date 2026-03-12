@@ -11,7 +11,7 @@ spot_hedge_symbol: "LIT/USDC"
 interval_secs: 10             # 10s cycle — LIT moves fast, need frequent requotes
 
 # Spread / quoting
-spread_bps: 15                # LIT native spread 5-30bps; 15bps base = ~7.5bps each side
+spread_bps: 25                # Must exceed spot taker cost (~10bps) per side: 25/2=12.5bps > 10bps
 order_size_pct: 0.02          # 2% of equity per order level
 order_levels: 2               # 2 levels each side for better fill probability
 level_spacing_bps: 10         # 2nd level 10bps deeper
@@ -30,7 +30,7 @@ force_close_cooldown_secs: 120
 volatility_window: 60
 volatility_spread_mult: 1.0
 min_spread_bps: 5
-max_spread_bps: 80
+max_spread_bps: 50
 
 # Adverse selection protection
 trend_window: 10
@@ -39,8 +39,8 @@ ema_short_periods: 5
 ema_long_periods: 20
 trend_strength_threshold: 10.0
 aggressive_unwind_bps: 2.0
-post_fill_spread_mult: 2.0
-post_fill_decay_secs: 30
+post_fill_spread_mult: 1.3
+post_fill_decay_secs: 15
 inventory_spread_mult: 0.5
 
 # Hedge (sub-account) — disabled, using spot hedge instead
