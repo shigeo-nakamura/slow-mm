@@ -411,14 +411,6 @@ enum CapturePhase {
         size: f64,
         placed_at: Instant,
     },
-    CloseWaiting {
-        order_id: String,
-        fill_side: OrderSide,
-        fill_price: f64,
-        fill_size: f64,
-        close_price: f64,
-        placed_at: Instant,
-    },
 }
 
 struct CaptureState {
@@ -732,22 +724,6 @@ impl MmEngine {
                 }
                 Ok(())
             }
-            CapturePhase::CloseWaiting { placed_at, fill_size, fill_side, fill_price, .. } => {
-                // Check if close order filled
-                self.capture_check_close_fill().await?;
-                // If still waiting and timed out, force close with market order
-                if matches!(self.capture_state.phase, CapturePhase::CloseWaiting { .. }) {
-                    if placed_at.elapsed().as_secs() > self.cfg.capture_close_timeout_secs {
-                        log::warn!("[CAPTURE] Close maker timeout, force closing with market order");
-                        let _ = self
-                            .main_conn
-                            .cancel_all_orders(Some(self.cfg.symbol.clone()))
-                            .await;
-                        self.capture_force_close(fill_side, fill_price, fill_size).await?;
-                    }
-                }
-                Ok(())
-            }
         }
     }
 
@@ -794,25 +770,20 @@ impl MmEngine {
             self.refresh_equity().await;
         }
 
-        // If we have residual inventory, always try to unwind with Post-Only
+        // If we have residual inventory, immediately unwind with market order
         if self.inventory.abs() > 0.0001 {
             let unwind_side = if self.inventory > 0.0 {
                 OrderSide::Short
             } else {
                 OrderSide::Long
             };
-            let unwind_price = match unwind_side {
-                OrderSide::Short => best_ask, // sell at ask
-                OrderSide::Long => best_bid,  // buy at bid
-            };
             let size_dec = self.round_size(self.inventory.abs());
-            let price_dec = self.round_price(unwind_price);
-            if size_dec > Decimal::ZERO && price_dec > Decimal::ZERO {
+            if size_dec > Decimal::ZERO {
                 log::info!(
-                    "[CAPTURE] Unwinding residual inv={:.6} with Post-Only {:?} at {}",
+                    "[CAPTURE] Unwinding residual inv={:.6} with market {:?} size={}",
                     self.inventory,
                     unwind_side,
-                    price_dec
+                    size_dec
                 );
                 match self
                     .main_conn
@@ -820,25 +791,19 @@ impl MmEngine {
                         &self.cfg.symbol,
                         size_dec,
                         unwind_side,
-                        Some(price_dec),
-                        Some(-2), // POST_ONLY
-                        true,     // reduce_only
-                        Some(self.cfg.capture_close_timeout_secs),
+                        None, // market order
+                        None,
+                        true, // reduce_only
+                        None,
                     )
                     .await
                 {
-                    Ok(resp) => {
-                        self.capture_state.phase = CapturePhase::CloseWaiting {
-                            order_id: resp.order_id,
-                            fill_side: unwind_side, // direction we're closing
-                            fill_price: unwind_price,
-                            fill_size: self.inventory.abs(),
-                            close_price: unwind_price,
-                            placed_at: Instant::now(),
-                        };
-                        return Ok(());
+                    Ok(_) => {
+                        sleep(Duration::from_secs(1)).await;
+                        self.sync_inventory_from_exchange().await;
+                        log::info!("[CAPTURE] Unwind complete, inv={:.6}", self.inventory);
                     }
-                    Err(e) => log::error!("[CAPTURE] Failed to place unwind order: {:?}", e),
+                    Err(e) => log::error!("[CAPTURE] Failed to unwind: {:?}", e),
                 }
             }
         }
@@ -887,9 +852,12 @@ impl MmEngine {
         let leverage = self.cfg.max_leverage as f64;
         let order_size = equity * self.cfg.order_size_pct * leverage / mid;
 
+        // Place INSIDE the spread (closer to mid) for better fill price
+        // Long: bid up from best_bid toward mid; Short: ask down from best_ask toward mid
+        let tick = mid * 0.0001; // ~1bps as minimum price increment
         let price = match side {
-            OrderSide::Long => best_bid,
-            OrderSide::Short => best_ask,
+            OrderSide::Long => best_bid + tick,   // improve bid (still below mid)
+            OrderSide::Short => best_ask - tick,   // improve ask (still above mid)
         };
 
         let price_dec = self.round_price(price);
@@ -989,199 +957,20 @@ impl MmEngine {
         // Update inventory
         self.sync_inventory_from_exchange().await;
 
-        // Place Post-Only close order on the opposite side of the book
-        self.capture_place_close(side, fill_price, total_size).await
-    }
-
-    /// Place a Post-Only maker order to close the position (captures spread)
-    async fn capture_place_close(
-        &mut self,
-        fill_side: OrderSide,
-        fill_price: f64,
-        fill_size: f64,
-    ) -> Result<()> {
-        let close_side = match fill_side {
+        // Immediately close with market order (zero fees, so only slippage matters)
+        let close_side = match side {
             OrderSide::Long => OrderSide::Short,
             OrderSide::Short => OrderSide::Long,
         };
 
-        // Get current OB to place at best bid/ask
-        let ob = self
-            .main_conn
-            .get_order_book(&self.cfg.symbol, self.cfg.ob_depth)
-            .await
-            .context("failed to get OB for close")?;
-
-        let best_bid = ob.bids.first().map(|l| l.price.to_f64().unwrap_or(0.0)).unwrap_or(0.0);
-        let best_ask = ob.asks.first().map(|l| l.price.to_f64().unwrap_or(0.0)).unwrap_or(0.0);
-
-        if best_bid <= 0.0 || best_ask <= 0.0 {
-            log::warn!("[CAPTURE] OB empty, cannot place close order");
-            return Ok(());
-        }
-
-        // Close price: if we bought (Long), sell at best ask; if we sold (Short), buy at best bid
-        let close_price = match close_side {
-            OrderSide::Short => best_ask, // sell at ask
-            OrderSide::Long => best_bid,  // buy at bid
-        };
-
-        let size_dec = self.round_size(fill_size);
-        let price_dec = self.round_price(close_price);
-
-        if size_dec <= Decimal::ZERO || price_dec <= Decimal::ZERO {
-            self.capture_state.phase = CapturePhase::Scanning;
-            return Ok(());
-        }
-
-        let est_pnl = match fill_side {
-            OrderSide::Long => (close_price - fill_price) * fill_size,
-            OrderSide::Short => (fill_price - close_price) * fill_size,
-        };
-
-        log::info!(
-            "[CAPTURE] Placing Post-Only close {:?} at {} size={} (est_pnl=${:.4})",
-            close_side,
-            price_dec,
-            size_dec,
-            est_pnl
-        );
-
-        match self
-            .main_conn
-            .create_order(
-                &self.cfg.symbol,
-                size_dec,
-                close_side,
-                Some(price_dec),
-                Some(-2), // POST_ONLY
-                true,     // reduce_only
-                Some(self.cfg.stale_order_secs),
-            )
-            .await
-        {
-            Ok(resp) => {
-                self.capture_state.phase = CapturePhase::CloseWaiting {
-                    order_id: resp.order_id,
-                    fill_side,
-                    fill_price,
-                    fill_size,
-                    close_price,
-                    placed_at: Instant::now(),
-                };
-            }
-            Err(e) => {
-                log::error!("[CAPTURE] Failed to place close maker: {:?}", e);
-                // Will retry next tick via capture_step
-            }
-        }
-        Ok(())
-    }
-
-    /// Check if close Post-Only order was filled
-    async fn capture_check_close_fill(&mut self) -> Result<()> {
-        let (fill_side, fill_price, _fill_size, close_price) = match &self.capture_state.phase {
-            CapturePhase::CloseWaiting {
-                fill_side,
-                fill_price,
-                fill_size,
-                close_price,
-                ..
-            } => (*fill_side, *fill_price, *fill_size, *close_price),
-            _ => return Ok(()),
-        };
-
-        let fills = self
-            .main_conn
-            .get_filled_orders(&self.cfg.symbol)
-            .await?;
-        if fills.orders.is_empty() {
-            return Ok(());
-        }
-
-        let mut total_size = 0.0;
-        let mut total_value = 0.0;
-        for fill in &fills.orders {
-            let sz = fill.filled_size.and_then(|s| s.to_f64()).unwrap_or(0.0);
-            let val = fill.filled_value.and_then(|v| v.to_f64()).unwrap_or(0.0);
-            total_size += sz;
-            total_value += val;
-            let _ = self
-                .main_conn
-                .clear_filled_order(&self.cfg.symbol, &fill.trade_id)
-                .await;
-        }
-
-        if total_size <= 0.0 {
-            return Ok(());
-        }
-
-        let actual_close_price = if total_value > 0.0 {
-            total_value / total_size
-        } else {
-            close_price
-        };
-
-        // Cancel any remaining orders
-        let _ = self
-            .main_conn
-            .cancel_all_orders(Some(self.cfg.symbol.clone()))
-            .await;
-
-        self.sync_inventory_from_exchange().await;
-        self.capture_state.captures += 1;
-
-        let pnl = match fill_side {
-            OrderSide::Long => (actual_close_price - fill_price) * total_size,
-            OrderSide::Short => (fill_price - actual_close_price) * total_size,
-        };
-        self.capture_state.capture_pnl += pnl;
-
-        log::info!(
-            "[CAPTURE] Round-trip #{}: open {:?}@{:.2} -> close@{:.2}, pnl=${:.4}, total=${:.4}, inv={:.6}",
-            self.capture_state.captures,
-            fill_side,
-            fill_price,
-            actual_close_price,
-            pnl,
-            self.capture_state.capture_pnl,
-            self.inventory
-        );
-
-        self.capture_state.phase = CapturePhase::Scanning;
-        Ok(())
-    }
-
-    /// Force close with market order (last resort on timeout)
-    /// Uses actual inventory from exchange, not stale phase data
-    async fn capture_force_close(
-        &mut self,
-        _fill_side: OrderSide,
-        _fill_price: f64,
-        _fill_size: f64,
-    ) -> Result<()> {
-        self.sync_inventory_from_exchange().await;
-
-        if self.inventory.abs() < 0.0001 {
-            log::info!("[CAPTURE] No inventory to force-close, back to scanning");
-            self.capture_state.phase = CapturePhase::Scanning;
-            return Ok(());
-        }
-
-        let close_side = if self.inventory > 0.0 {
-            OrderSide::Short
-        } else {
-            OrderSide::Long
-        };
-
-        let size_dec = self.round_size(self.inventory.abs());
+        let size_dec = self.round_size(total_size);
         if size_dec <= Decimal::ZERO {
             self.capture_state.phase = CapturePhase::Scanning;
             return Ok(());
         }
 
-        log::warn!(
-            "[CAPTURE] Force closing with market {:?} size={}",
+        log::info!(
+            "[CAPTURE] Closing immediately with market {:?} size={}",
             close_side,
             size_dec
         );
@@ -1192,9 +981,9 @@ impl MmEngine {
                 &self.cfg.symbol,
                 size_dec,
                 close_side,
-                None, // market order
+                None, // market order = IOC at best price
                 None,
-                true,
+                true, // reduce_only
                 None,
             )
             .await
@@ -1204,18 +993,30 @@ impl MmEngine {
                 self.sync_inventory_from_exchange().await;
                 self.capture_state.captures += 1;
 
-                log::warn!(
-                    "[CAPTURE] Force-closed #{}: market {:?} size={}, inv={:.6}",
+                // Estimate PnL from mid (actual close price unknown without re-fetching fills)
+                let mid = self.last_mid.unwrap_or(fill_price);
+                let est_pnl = match side {
+                    OrderSide::Long => (mid - fill_price) * total_size,
+                    OrderSide::Short => (fill_price - mid) * total_size,
+                };
+                self.capture_state.capture_pnl += est_pnl;
+
+                log::info!(
+                    "[CAPTURE] Round-trip #{}: {:?}@{:.2} -> market close, est_pnl=${:.4}, total=${:.4}, inv={:.6}",
                     self.capture_state.captures,
-                    close_side,
-                    size_dec,
+                    side,
+                    fill_price,
+                    est_pnl,
+                    self.capture_state.capture_pnl,
                     self.inventory
                 );
 
                 self.capture_state.phase = CapturePhase::Scanning;
             }
             Err(e) => {
-                log::error!("[CAPTURE] Force close failed: {:?}", e);
+                log::error!("[CAPTURE] Market close failed: {:?}, back to scanning", e);
+                // Don't get stuck - go back to scanning, unwind logic will handle residual
+                self.capture_state.phase = CapturePhase::Scanning;
             }
         }
         Ok(())
