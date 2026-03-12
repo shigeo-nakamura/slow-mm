@@ -49,6 +49,8 @@ const DEFAULT_AGGRESSIVE_UNWIND_BPS: f64 = 0.0;
 const DEFAULT_POST_FILL_SPREAD_MULT: f64 = 2.0;
 const DEFAULT_POST_FILL_DECAY_SECS: u64 = 30;
 const DEFAULT_INVENTORY_SPREAD_MULT: f64 = 1.0;
+const DEFAULT_CAPTURE_MIN_SPREAD_BPS: f64 = 5.0;
+const DEFAULT_CAPTURE_CLOSE_TIMEOUT_SECS: u64 = 30;
 
 // ---------------------------------------------------------------------------
 // YAML config
@@ -91,6 +93,9 @@ struct MmYaml {
     post_fill_spread_mult: Option<f64>,
     post_fill_decay_secs: Option<u64>,
     inventory_spread_mult: Option<f64>,
+    strategy_mode: Option<String>,
+    capture_min_spread_bps: Option<f64>,
+    capture_close_timeout_secs: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +165,12 @@ pub struct MmConfig {
     pub post_fill_decay_secs: u64,
     /// Spread widens proportionally to inventory: spread *= (1 + |inv_ratio| * this)
     pub inventory_spread_mult: f64,
+    /// Strategy mode: "passive_mm" (default) or "reactive_capture"
+    pub strategy_mode: String,
+    /// Minimum OB spread in bps to trigger a capture order
+    pub capture_min_spread_bps: f64,
+    /// Timeout in seconds to force-close a capture position
+    pub capture_close_timeout_secs: u64,
 }
 
 impl MmConfig {
@@ -245,6 +256,15 @@ impl MmConfig {
             inventory_spread_mult: yaml
                 .inventory_spread_mult
                 .unwrap_or(DEFAULT_INVENTORY_SPREAD_MULT),
+            strategy_mode: yaml
+                .strategy_mode
+                .unwrap_or_else(|| "passive_mm".to_string()),
+            capture_min_spread_bps: yaml
+                .capture_min_spread_bps
+                .unwrap_or(DEFAULT_CAPTURE_MIN_SPREAD_BPS),
+            capture_close_timeout_secs: yaml
+                .capture_close_timeout_secs
+                .unwrap_or(DEFAULT_CAPTURE_CLOSE_TIMEOUT_SECS),
         };
         cfg.apply_env_overrides();
         Ok(cfg)
@@ -322,6 +342,16 @@ impl MmConfig {
                 "INVENTORY_SPREAD_MULT",
                 DEFAULT_INVENTORY_SPREAD_MULT,
             ),
+            strategy_mode: env::var("STRATEGY_MODE")
+                .unwrap_or_else(|_| "passive_mm".to_string()),
+            capture_min_spread_bps: parse_env(
+                "CAPTURE_MIN_SPREAD_BPS",
+                DEFAULT_CAPTURE_MIN_SPREAD_BPS,
+            ),
+            capture_close_timeout_secs: parse_env(
+                "CAPTURE_CLOSE_TIMEOUT_SECS",
+                DEFAULT_CAPTURE_CLOSE_TIMEOUT_SECS,
+            ),
         };
         cfg.apply_env_overrides();
         Ok(cfg)
@@ -342,6 +372,35 @@ fn parse_env<T: std::str::FromStr>(key: &str, default: T) -> T {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+// ---------------------------------------------------------------------------
+// Reactive Capture state machine
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+enum CapturePhase {
+    Scanning,
+    MakerPending {
+        order_id: String,
+        side: OrderSide,
+        price: f64,
+        size: f64,
+        placed_at: Instant,
+    },
+    ClosePending {
+        fill_side: OrderSide,
+        fill_price: f64,
+        fill_size: f64,
+        filled_at: Instant,
+    },
+}
+
+struct CaptureState {
+    phase: CapturePhase,
+    captures: u64,
+    capture_pnl: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -396,6 +455,8 @@ pub struct MmEngine {
     total_ask_fills: u64,
     /// Dashboard status reporter
     status_reporter: Option<StatusReporter>,
+    /// State for reactive spread capture strategy
+    capture_state: CaptureState,
 }
 
 impl MmEngine {
@@ -468,6 +529,11 @@ impl MmEngine {
             total_bid_fills: 0,
             total_ask_fills: 0,
             status_reporter,
+            capture_state: CaptureState {
+                phase: CapturePhase::Scanning,
+                captures: 0,
+                capture_pnl: 0.0,
+            },
         })
     }
 
@@ -538,6 +604,15 @@ impl MmEngine {
         self.hedge_position = 0.0;
         self.realized_pnl = 0.0;
 
+        log::info!("[MM] Strategy mode: {}", self.cfg.strategy_mode);
+
+        match self.cfg.strategy_mode.as_str() {
+            "reactive_capture" => self.run_reactive().await,
+            _ => self.run_passive_mm().await,
+        }
+    }
+
+    async fn run_passive_mm(&mut self) -> Result<()> {
         let mut ticker = tokio::time::interval(Duration::from_secs(self.cfg.interval_secs));
         let mut fill_checker = tokio::time::interval(Duration::from_secs(2));
         let mut sigterm =
@@ -567,6 +642,351 @@ impl MmEngine {
             }
         }
         self.shutdown().await;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Reactive spread capture strategy
+    // -----------------------------------------------------------------------
+
+    async fn run_reactive(&mut self) -> Result<()> {
+        log::info!("[CAPTURE] Starting reactive spread capture strategy");
+        log::info!(
+            "[CAPTURE] min_spread_bps={} close_timeout={}s stale_order={}s",
+            self.cfg.capture_min_spread_bps,
+            self.cfg.capture_close_timeout_secs,
+            self.cfg.stale_order_secs,
+        );
+        let mut ticker = tokio::time::interval(Duration::from_secs(2));
+        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM");
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if let Err(e) = self.capture_step().await {
+                        log::error!("[CAPTURE] step failed: {:?}", e);
+                    }
+                }
+                _ = sigterm.recv() => {
+                    log::info!("[CAPTURE] SIGTERM received");
+                    break;
+                }
+            }
+        }
+        self.shutdown().await;
+        Ok(())
+    }
+
+    async fn capture_step(&mut self) -> Result<()> {
+        if self.check_maintenance().await {
+            return Ok(());
+        }
+
+        // Clone out the data we need to avoid borrowing self in match
+        let phase = self.capture_state.phase.clone();
+        match phase {
+            CapturePhase::Scanning => self.capture_scan().await,
+            CapturePhase::MakerPending { placed_at, .. } => {
+                // Check for fills
+                self.capture_check_maker_fill().await?;
+                // If still pending, check if stale
+                if matches!(self.capture_state.phase, CapturePhase::MakerPending { .. }) {
+                    if placed_at.elapsed().as_secs() > self.cfg.stale_order_secs {
+                        log::info!("[CAPTURE] Maker order stale, cancelling");
+                        let _ = self
+                            .main_conn
+                            .cancel_all_orders(Some(self.cfg.symbol.clone()))
+                            .await;
+                        self.capture_state.phase = CapturePhase::Scanning;
+                    }
+                }
+                Ok(())
+            }
+            CapturePhase::ClosePending { filled_at, .. } => {
+                // Try to close
+                self.capture_close().await?;
+                // If still pending and timed out, force close
+                if matches!(self.capture_state.phase, CapturePhase::ClosePending { .. }) {
+                    if filled_at.elapsed().as_secs() > self.cfg.capture_close_timeout_secs {
+                        log::warn!("[CAPTURE] Close timeout, force closing");
+                        self.capture_close().await?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn capture_scan(&mut self) -> Result<()> {
+        let ob = self
+            .main_conn
+            .get_order_book(&self.cfg.symbol, self.cfg.ob_depth)
+            .await
+            .context("failed to get order book")?;
+
+        let best_bid = ob
+            .bids
+            .first()
+            .map(|l| l.price.to_f64().unwrap_or(0.0))
+            .unwrap_or(0.0);
+        let best_ask = ob
+            .asks
+            .first()
+            .map(|l| l.price.to_f64().unwrap_or(0.0))
+            .unwrap_or(0.0);
+
+        if best_bid <= 0.0 || best_ask <= 0.0 || best_bid >= best_ask {
+            return Ok(());
+        }
+
+        let mid = (best_bid + best_ask) / 2.0;
+        let spread_bps = (best_ask - best_bid) / mid * 10_000.0;
+
+        // Update tracking
+        self.mid_prices.push(mid);
+        if self.mid_prices.len() > self.cfg.volatility_window {
+            self.mid_prices
+                .drain(0..self.mid_prices.len() - self.cfg.volatility_window);
+        }
+        self.update_ema(mid);
+        self.last_mid = Some(mid);
+
+        // Refresh equity periodically
+        if self
+            .last_equity_fetch
+            .map(|t| t.elapsed().as_secs() > 300)
+            .unwrap_or(true)
+        {
+            self.refresh_equity().await;
+        }
+
+        if spread_bps < self.cfg.capture_min_spread_bps {
+            log::debug!(
+                "[CAPTURE] spread={:.1}bps < min={:.1}bps, waiting",
+                spread_bps,
+                self.cfg.capture_min_spread_bps
+            );
+            return Ok(());
+        }
+
+        // Check EMA trend - if strong trend, don't enter
+        let ema_trend = self.compute_ema_trend_bps();
+        if ema_trend.abs() > self.cfg.trend_strength_threshold {
+            log::info!("[CAPTURE] Trend {:.1}bps, skipping", ema_trend);
+            return Ok(());
+        }
+
+        // Choose side: prefer reducing inventory, otherwise side with more depth
+        let side = if self.inventory > 0.0 {
+            OrderSide::Short // sell to reduce long
+        } else if self.inventory < 0.0 {
+            OrderSide::Long // buy to reduce short
+        } else {
+            // Flat: join side with more depth (safer)
+            let bid_depth: f64 = ob
+                .bids
+                .iter()
+                .map(|l| l.size.to_f64().unwrap_or(0.0))
+                .sum();
+            let ask_depth: f64 = ob
+                .asks
+                .iter()
+                .map(|l| l.size.to_f64().unwrap_or(0.0))
+                .sum();
+            if bid_depth >= ask_depth {
+                OrderSide::Long
+            } else {
+                OrderSide::Short
+            }
+        };
+
+        let equity = self.equity_cache;
+        let leverage = self.cfg.max_leverage as f64;
+        let order_size = equity * self.cfg.order_size_pct * leverage / mid;
+
+        let price = match side {
+            OrderSide::Long => best_bid,
+            OrderSide::Short => best_ask,
+        };
+
+        let price_dec = self.round_price(price);
+        let size_dec = self.round_size(order_size);
+
+        if size_dec <= Decimal::ZERO || price_dec <= Decimal::ZERO {
+            return Ok(());
+        }
+
+        log::info!(
+            "[CAPTURE] spread={:.1}bps, placing {:?} Post-Only at {} size={}",
+            spread_bps,
+            side,
+            price_dec,
+            size_dec
+        );
+
+        match self
+            .main_conn
+            .create_order(
+                &self.cfg.symbol,
+                size_dec,
+                side,
+                Some(price_dec),
+                Some(-2), // POST_ONLY
+                false,
+                Some(self.cfg.stale_order_secs),
+            )
+            .await
+        {
+            Ok(resp) => {
+                self.capture_state.phase = CapturePhase::MakerPending {
+                    order_id: resp.order_id,
+                    side,
+                    price: price_dec.to_f64().unwrap_or(price),
+                    size: size_dec.to_f64().unwrap_or(order_size),
+                    placed_at: Instant::now(),
+                };
+            }
+            Err(e) => log::error!("[CAPTURE] Failed to place maker: {:?}", e),
+        }
+        Ok(())
+    }
+
+    async fn capture_check_maker_fill(&mut self) -> Result<()> {
+        let (side, price, _size) = match &self.capture_state.phase {
+            CapturePhase::MakerPending {
+                side, price, size, ..
+            } => (*side, *price, *size),
+            _ => return Ok(()),
+        };
+
+        let fills = self
+            .main_conn
+            .get_filled_orders(&self.cfg.symbol)
+            .await?;
+        if fills.orders.is_empty() {
+            return Ok(());
+        }
+
+        let mut total_size = 0.0;
+        let mut total_value = 0.0;
+        for fill in &fills.orders {
+            let sz = fill.filled_size.and_then(|s| s.to_f64()).unwrap_or(0.0);
+            let val = fill.filled_value.and_then(|v| v.to_f64()).unwrap_or(0.0);
+            total_size += sz;
+            total_value += val;
+            let _ = self
+                .main_conn
+                .clear_filled_order(&self.cfg.symbol, &fill.trade_id)
+                .await;
+        }
+
+        if total_size <= 0.0 {
+            return Ok(());
+        }
+
+        let fill_price = if total_value > 0.0 {
+            total_value / total_size
+        } else {
+            price
+        };
+
+        log::info!(
+            "[CAPTURE] Maker FILLED: {:?} size={:.6} price={:.2}",
+            side,
+            total_size,
+            fill_price
+        );
+
+        // Cancel any remaining orders (partial fills)
+        let _ = self
+            .main_conn
+            .cancel_all_orders(Some(self.cfg.symbol.clone()))
+            .await;
+
+        // Update inventory
+        self.sync_inventory_from_exchange().await;
+
+        self.capture_state.phase = CapturePhase::ClosePending {
+            fill_side: side,
+            fill_price,
+            fill_size: total_size,
+            filled_at: Instant::now(),
+        };
+
+        // Immediately try to close
+        self.capture_close().await
+    }
+
+    async fn capture_close(&mut self) -> Result<()> {
+        let (fill_side, fill_price, fill_size) = match &self.capture_state.phase {
+            CapturePhase::ClosePending {
+                fill_side,
+                fill_price,
+                fill_size,
+                ..
+            } => (*fill_side, *fill_price, *fill_size),
+            _ => return Ok(()),
+        };
+
+        let close_side = match fill_side {
+            OrderSide::Long => OrderSide::Short,
+            OrderSide::Short => OrderSide::Long,
+        };
+
+        let size_dec = self.round_size(fill_size);
+        if size_dec <= Decimal::ZERO {
+            self.capture_state.phase = CapturePhase::Scanning;
+            return Ok(());
+        }
+
+        log::info!(
+            "[CAPTURE] Closing with market {:?} size={}",
+            close_side,
+            size_dec
+        );
+
+        match self
+            .main_conn
+            .create_order(
+                &self.cfg.symbol,
+                size_dec,
+                close_side,
+                None, // market order = IOC
+                None, true, None,
+            )
+            .await
+        {
+            Ok(_) => {
+                // Wait briefly for settlement
+                sleep(Duration::from_secs(1)).await;
+                self.sync_inventory_from_exchange().await;
+
+                self.capture_state.captures += 1;
+
+                // Log result (exact PnL is estimated)
+                let mid = self.last_mid.unwrap_or(fill_price);
+                let est_pnl = match fill_side {
+                    OrderSide::Long => (mid - fill_price) * fill_size,
+                    OrderSide::Short => (fill_price - mid) * fill_size,
+                };
+                self.capture_state.capture_pnl += est_pnl;
+
+                log::info!(
+                    "[CAPTURE] Round-trip #{}: {:?}@{:.2} -> close, est_pnl=${:.4}, total=${:.4}, inv={:.6}",
+                    self.capture_state.captures,
+                    fill_side,
+                    fill_price,
+                    est_pnl,
+                    self.capture_state.capture_pnl,
+                    self.inventory
+                );
+
+                self.capture_state.phase = CapturePhase::Scanning;
+            }
+            Err(e) => {
+                log::error!("[CAPTURE] Close failed: {:?}, will retry", e);
+                // Stay in ClosePending, will retry next tick
+            }
+        }
         Ok(())
     }
 
