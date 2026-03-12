@@ -51,3 +51,5 @@ stale_order_secs: 300
 # Reactive spread capture
 capture_min_spread_bps: 5
 capture_close_timeout_secs: 30
+capture_scan_interval_secs: 10     # OB scan every 10s (6 req/min)
+capture_poll_interval_secs: 2      # fill check every 2s when order active

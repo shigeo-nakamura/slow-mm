@@ -51,6 +51,8 @@ const DEFAULT_POST_FILL_DECAY_SECS: u64 = 30;
 const DEFAULT_INVENTORY_SPREAD_MULT: f64 = 1.0;
 const DEFAULT_CAPTURE_MIN_SPREAD_BPS: f64 = 5.0;
 const DEFAULT_CAPTURE_CLOSE_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_CAPTURE_SCAN_INTERVAL_SECS: u64 = 10;
+const DEFAULT_CAPTURE_POLL_INTERVAL_SECS: u64 = 2;
 
 // ---------------------------------------------------------------------------
 // YAML config
@@ -96,6 +98,8 @@ struct MmYaml {
     strategy_mode: Option<String>,
     capture_min_spread_bps: Option<f64>,
     capture_close_timeout_secs: Option<u64>,
+    capture_scan_interval_secs: Option<u64>,
+    capture_poll_interval_secs: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +175,10 @@ pub struct MmConfig {
     pub capture_min_spread_bps: f64,
     /// Timeout in seconds to force-close a capture position
     pub capture_close_timeout_secs: u64,
+    /// Seconds between OB scans in reactive capture (Scanning phase)
+    pub capture_scan_interval_secs: u64,
+    /// Seconds between fill-poll checks (MakerPending/ClosePending phase)
+    pub capture_poll_interval_secs: u64,
 }
 
 impl MmConfig {
@@ -265,6 +273,12 @@ impl MmConfig {
             capture_close_timeout_secs: yaml
                 .capture_close_timeout_secs
                 .unwrap_or(DEFAULT_CAPTURE_CLOSE_TIMEOUT_SECS),
+            capture_scan_interval_secs: yaml
+                .capture_scan_interval_secs
+                .unwrap_or(DEFAULT_CAPTURE_SCAN_INTERVAL_SECS),
+            capture_poll_interval_secs: yaml
+                .capture_poll_interval_secs
+                .unwrap_or(DEFAULT_CAPTURE_POLL_INTERVAL_SECS),
         };
         cfg.apply_env_overrides();
         Ok(cfg)
@@ -351,6 +365,14 @@ impl MmConfig {
             capture_close_timeout_secs: parse_env(
                 "CAPTURE_CLOSE_TIMEOUT_SECS",
                 DEFAULT_CAPTURE_CLOSE_TIMEOUT_SECS,
+            ),
+            capture_scan_interval_secs: parse_env(
+                "CAPTURE_SCAN_INTERVAL_SECS",
+                DEFAULT_CAPTURE_SCAN_INTERVAL_SECS,
+            ),
+            capture_poll_interval_secs: parse_env(
+                "CAPTURE_POLL_INTERVAL_SECS",
+                DEFAULT_CAPTURE_POLL_INTERVAL_SECS,
             ),
         };
         cfg.apply_env_overrides();
@@ -652,16 +674,22 @@ impl MmEngine {
     async fn run_reactive(&mut self) -> Result<()> {
         log::info!("[CAPTURE] Starting reactive spread capture strategy");
         log::info!(
-            "[CAPTURE] min_spread_bps={} close_timeout={}s stale_order={}s",
+            "[CAPTURE] min_spread_bps={} close_timeout={}s scan_interval={}s poll_interval={}s",
             self.cfg.capture_min_spread_bps,
             self.cfg.capture_close_timeout_secs,
-            self.cfg.stale_order_secs,
+            self.cfg.capture_scan_interval_secs,
+            self.cfg.capture_poll_interval_secs,
         );
-        let mut ticker = tokio::time::interval(Duration::from_secs(2));
         let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM");
         loop {
+            // Phase-adaptive interval: fast poll when waiting for fills, slower when scanning
+            let interval = match &self.capture_state.phase {
+                CapturePhase::Scanning => Duration::from_secs(self.cfg.capture_scan_interval_secs),
+                _ => Duration::from_secs(self.cfg.capture_poll_interval_secs),
+            };
+
             tokio::select! {
-                _ = ticker.tick() => {
+                _ = sleep(interval) => {
                     if let Err(e) = self.capture_step().await {
                         log::error!("[CAPTURE] step failed: {:?}", e);
                     }
