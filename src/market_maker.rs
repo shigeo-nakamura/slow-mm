@@ -1318,10 +1318,7 @@ impl MmEngine {
             return Ok(());
         }
 
-        // 1. Cancel existing orders BEFORE reading OB (so our own orders don't pollute best bid/ask)
-        self.cancel_all_main_orders().await;
-
-        // 1b. Get order book to determine mid price (clean of our own orders)
+        // 1. Get order book first to check if mid has moved enough to warrant requote
         let ob = self
             .main_conn
             .get_order_book(&self.cfg.symbol, self.cfg.ob_depth)
@@ -1345,6 +1342,39 @@ impl MmEngine {
         }
 
         let mid = (best_bid + best_ask) / 2.0;
+
+        // 1b. Skip requote if mid hasn't moved enough (save TX rate limit)
+        // Requote when mid moves > min_spread_bps/4 from last quote, or no orders are active
+        let has_active_orders = !self.active_bid_ids.is_empty() || !self.active_ask_ids.is_empty();
+        if has_active_orders {
+            if let Some(prev_mid) = self.last_mid {
+                let move_bps = ((mid - prev_mid) / prev_mid).abs() * 10_000.0;
+                if move_bps < self.cfg.min_spread_bps / 4.0 {
+                    // Mid barely moved — keep existing orders, just update EMA/volatility
+                    self.mid_prices.push(mid);
+                    if self.mid_prices.len() > self.cfg.volatility_window {
+                        self.mid_prices.drain(0..self.mid_prices.len() - self.cfg.volatility_window);
+                    }
+                    self.update_ema(mid);
+                    self.last_mid = Some(mid);
+                    // Still check fills and refresh equity
+                    self.check_fills_and_rebalance().await;
+                    self.process_fills().await;
+                    self.refresh_equity().await;
+                    let total_equity = self.equity_cache + self.hedge_equity_cache;
+                    if self.status_reporter.is_some() {
+                        let positions = self.build_position_info().await;
+                        let reporter = self.status_reporter.as_mut().unwrap();
+                        reporter.update_equity(total_equity);
+                        let _ = reporter.write_snapshot_if_due(&positions);
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        // 1c. Cancel existing orders before placing new ones
+        self.cancel_all_main_orders().await;
 
         // 2. Update mid price history for volatility
         self.mid_prices.push(mid);

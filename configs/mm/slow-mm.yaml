@@ -8,7 +8,7 @@ size_decimals: 2               # LIT: 209.42 (0.01 step)
 spot_hedge_symbol: "LIT/USDC"
 
 # Timing
-interval_secs: 10             # 10s cycle — LIT moves fast, need frequent requotes
+interval_secs: 30             # 30s cycle — LIT spread is wide, no need to requote often
 
 # Spread / quoting
 spread_bps: 25                # Must exceed spot taker cost (~10bps) per side: 25/2=12.5bps > 10bps
