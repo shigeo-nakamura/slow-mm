@@ -775,13 +775,31 @@ impl MmEngine {
         let mut trend_pause_ask = false;
 
         if ema_trend_bps.abs() > self.cfg.trend_strength_threshold {
-            // Strong trend detected — stop quoting on BOTH sides to avoid adverse selection
-            trend_pause_bid = true;
-            trend_pause_ask = true;
+            // Strong trend detected — pause position-increasing side
+            // BUT always allow position-reducing side to unwind inventory
+            if ema_trend_bps > 0.0 {
+                // Trend UP → pause BID (don't go long into up-trend as taker)
+                // Allow ASK if long (to reduce), pause ASK if flat/short (don't initiate short)
+                trend_pause_bid = true;
+                if self.inventory <= 0.0 {
+                    trend_pause_ask = true; // no position to unwind, pause both
+                }
+            } else {
+                // Trend DOWN → pause ASK (don't go short into down-trend)
+                // Allow BID if short (to reduce), pause BID if flat/long (don't initiate long)
+                trend_pause_ask = true;
+                if self.inventory >= 0.0 {
+                    trend_pause_bid = true; // no position to unwind, pause both
+                }
+            }
             let direction = if ema_trend_bps > 0.0 { "UP" } else { "DOWN" };
+            let unwind_side = if self.inventory > 0.0 { "ASK(unwind)" }
+                else if self.inventory < 0.0 { "BID(unwind)" }
+                else { "none" };
             log::info!(
-                "[MM] TREND {} detected: EMA divergence {:.1}bps > {:.1}bps threshold, legacy_trend={:.1}bps — pausing BOTH sides",
-                direction, ema_trend_bps.abs(), self.cfg.trend_strength_threshold, trend_bps
+                "[MM] TREND {} detected: EMA {:.1}bps > {:.1}bps, legacy={:.1}bps — allowing {} inv={:.6}",
+                direction, ema_trend_bps.abs(), self.cfg.trend_strength_threshold, trend_bps,
+                unwind_side, self.inventory
             );
         } else if trend_bps.abs() > self.cfg.trend_threshold_bps {
             // Moderate trend (legacy) — pause only the position-increasing side
