@@ -21,8 +21,8 @@ funding_rate_factor: 1.0      # bias skew toward FR-favorable side
 
 # Inventory management
 max_inventory_pct: 0.05       # 5% of equity as max unhedged inventory
-skew_factor: 2.0              # moderate skew
-inventory_hard_limit_mult: 2.0
+skew_factor: 5.0              # strong skew to discourage adding to position
+inventory_hard_limit_mult: 0.4    # ~1 order fill = hard limit, stop same-side quotes
 force_close_mult: 1.5
 force_close_cooldown_secs: 120
 
