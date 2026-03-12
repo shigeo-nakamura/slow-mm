@@ -794,6 +794,55 @@ impl MmEngine {
             self.refresh_equity().await;
         }
 
+        // If we have residual inventory, always try to unwind with Post-Only
+        if self.inventory.abs() > 0.0001 {
+            let unwind_side = if self.inventory > 0.0 {
+                OrderSide::Short
+            } else {
+                OrderSide::Long
+            };
+            let unwind_price = match unwind_side {
+                OrderSide::Short => best_ask, // sell at ask
+                OrderSide::Long => best_bid,  // buy at bid
+            };
+            let size_dec = self.round_size(self.inventory.abs());
+            let price_dec = self.round_price(unwind_price);
+            if size_dec > Decimal::ZERO && price_dec > Decimal::ZERO {
+                log::info!(
+                    "[CAPTURE] Unwinding residual inv={:.6} with Post-Only {:?} at {}",
+                    self.inventory,
+                    unwind_side,
+                    price_dec
+                );
+                match self
+                    .main_conn
+                    .create_order(
+                        &self.cfg.symbol,
+                        size_dec,
+                        unwind_side,
+                        Some(price_dec),
+                        Some(-2), // POST_ONLY
+                        true,     // reduce_only
+                        Some(self.cfg.capture_close_timeout_secs),
+                    )
+                    .await
+                {
+                    Ok(resp) => {
+                        self.capture_state.phase = CapturePhase::CloseWaiting {
+                            order_id: resp.order_id,
+                            fill_side: unwind_side, // direction we're closing
+                            fill_price: unwind_price,
+                            fill_size: self.inventory.abs(),
+                            close_price: unwind_price,
+                            placed_at: Instant::now(),
+                        };
+                        return Ok(());
+                    }
+                    Err(e) => log::error!("[CAPTURE] Failed to place unwind order: {:?}", e),
+                }
+            }
+        }
+
         if spread_bps < self.cfg.capture_min_spread_bps {
             log::debug!(
                 "[CAPTURE] spread={:.1}bps < min={:.1}bps, waiting",
@@ -1104,18 +1153,28 @@ impl MmEngine {
     }
 
     /// Force close with market order (last resort on timeout)
+    /// Uses actual inventory from exchange, not stale phase data
     async fn capture_force_close(
         &mut self,
-        fill_side: OrderSide,
-        fill_price: f64,
-        fill_size: f64,
+        _fill_side: OrderSide,
+        _fill_price: f64,
+        _fill_size: f64,
     ) -> Result<()> {
-        let close_side = match fill_side {
-            OrderSide::Long => OrderSide::Short,
-            OrderSide::Short => OrderSide::Long,
+        self.sync_inventory_from_exchange().await;
+
+        if self.inventory.abs() < 0.0001 {
+            log::info!("[CAPTURE] No inventory to force-close, back to scanning");
+            self.capture_state.phase = CapturePhase::Scanning;
+            return Ok(());
+        }
+
+        let close_side = if self.inventory > 0.0 {
+            OrderSide::Short
+        } else {
+            OrderSide::Long
         };
 
-        let size_dec = self.round_size(fill_size);
+        let size_dec = self.round_size(self.inventory.abs());
         if size_dec <= Decimal::ZERO {
             self.capture_state.phase = CapturePhase::Scanning;
             return Ok(());
@@ -1146,10 +1205,10 @@ impl MmEngine {
                 self.capture_state.captures += 1;
 
                 log::warn!(
-                    "[CAPTURE] Force-closed #{}: {:?}@{:.2} (market), inv={:.6}",
+                    "[CAPTURE] Force-closed #{}: market {:?} size={}, inv={:.6}",
                     self.capture_state.captures,
-                    fill_side,
-                    fill_price,
+                    close_side,
+                    size_dec,
                     self.inventory
                 );
 
