@@ -891,7 +891,7 @@ impl MmEngine {
         // Place bid (Long) Post-Only
         let bid_result = self.main_conn.create_order(
             &self.cfg.symbol, size_dec, OrderSide::Long,
-            Some(bid_price_dec), Some(0), false, Some(self.cfg.stale_order_secs),
+            Some(bid_price_dec), Some(-2), false, Some(self.cfg.stale_order_secs),
         ).await;
 
         let bid_order_id = match bid_result {
@@ -905,7 +905,7 @@ impl MmEngine {
         // Place ask (Short) Post-Only
         let ask_result = self.main_conn.create_order(
             &self.cfg.symbol, size_dec, OrderSide::Short,
-            Some(ask_price_dec), Some(0), false, Some(self.cfg.stale_order_secs),
+            Some(ask_price_dec), Some(-2), false, Some(self.cfg.stale_order_secs),
         ).await;
 
         let ask_order_id = match ask_result {
@@ -1000,7 +1000,7 @@ impl MmEngine {
                         );
                         let _ = self.main_conn.create_order(
                             &self.cfg.symbol, size_dec, close_side,
-                            Some(price_dec), Some(0), true, Some(self.cfg.stale_order_secs),
+                            Some(price_dec), Some(-2), true, Some(self.cfg.stale_order_secs),
                         ).await;
                     }
                     close_side_price
@@ -1127,7 +1127,7 @@ impl MmEngine {
 
         match self.main_conn.create_order(
             &self.cfg.symbol, size_dec, close_side,
-            Some(close_price_dec), Some(0), true, Some(self.cfg.stale_order_secs),
+            Some(close_price_dec), Some(-2), true, Some(self.cfg.stale_order_secs),
         ).await {
             Ok(_) => {
                 let now = Instant::now();
@@ -1626,6 +1626,7 @@ impl MmEngine {
                     continue;
                 }
 
+                // POST_ONLY (spread=-2) ensures maker-only execution, no taker fills
                 match self
                     .main_conn
                     .create_order(
@@ -1633,7 +1634,7 @@ impl MmEngine {
                         size_dec,
                         OrderSide::Long,
                         Some(bid_price_dec),
-                        None,
+                        Some(-2),
                         false,
                         Some(self.cfg.stale_order_secs),
                     )
@@ -1649,7 +1650,7 @@ impl MmEngine {
                         new_bid_ids.push(resp.order_id);
                     }
                     Err(e) => {
-                        log::error!("[MM] Failed to place bid L{}: {:?}", level, e);
+                        log::warn!("[MM] BID L{} rejected (POST_ONLY): {:?}", level, e);
                     }
                 }
             }
@@ -1697,7 +1698,7 @@ impl MmEngine {
                         size_dec,
                         OrderSide::Short,
                         Some(ask_price_dec),
-                        None,
+                        Some(-2),
                         false,
                         Some(self.cfg.stale_order_secs),
                     )
@@ -1713,7 +1714,7 @@ impl MmEngine {
                         new_ask_ids.push(resp.order_id);
                     }
                     Err(e) => {
-                        log::error!("[MM] Failed to place ask L{}: {:?}", level, e);
+                        log::warn!("[MM] ASK L{} rejected (POST_ONLY): {:?}", level, e);
                     }
                 }
             }
@@ -1795,8 +1796,27 @@ impl MmEngine {
                 log::warn!("[MM] Failed to get balance, using cached equity {:.2}: {:?}", self.equity_cache, e);
             }
         }
-        // Also refresh hedge equity
-        if let Some(ref hedge) = self.hedge_conn {
+        // Also refresh hedge/spot equity
+        if !self.cfg.spot_hedge_symbol.is_empty() {
+            // Spot hedge: use total_asset_value from Lighter API (perp + spot combined)
+            match self.main_conn.get_combined_balance().await {
+                Ok(combined) => {
+                    let total = combined.total_asset_value.to_f64().unwrap_or(0.0);
+                    if total > 0.0 {
+                        // total_asset_value = perp + spot. Spot equity = total - perp.
+                        let spot_equity = (total - self.equity_cache).max(0.0);
+                        self.hedge_equity_cache = spot_equity;
+                        log::debug!(
+                            "[MM] Total asset value: {:.2}, perp: {:.2}, spot: {:.2}",
+                            total, self.equity_cache, spot_equity
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::warn!("[MM] Failed to get combined balance: {:?}", e);
+                }
+            }
+        } else if let Some(ref hedge) = self.hedge_conn {
             match hedge.get_balance(None).await {
                 Ok(bal) => {
                     let equity = bal.equity.to_f64().unwrap_or(0.0);
