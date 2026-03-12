@@ -45,6 +45,7 @@ const DEFAULT_TREND_THRESHOLD_BPS: f64 = 3.0;
 const DEFAULT_EMA_SHORT_PERIODS: usize = 5;
 const DEFAULT_EMA_LONG_PERIODS: usize = 20;
 const DEFAULT_TREND_STRENGTH_THRESHOLD: f64 = 2.0;
+const DEFAULT_AGGRESSIVE_UNWIND_BPS: f64 = 0.0;
 const DEFAULT_POST_FILL_SPREAD_MULT: f64 = 2.0;
 const DEFAULT_POST_FILL_DECAY_SECS: u64 = 30;
 const DEFAULT_INVENTORY_SPREAD_MULT: f64 = 1.0;
@@ -86,6 +87,7 @@ struct MmYaml {
     ema_short_periods: Option<usize>,
     ema_long_periods: Option<usize>,
     trend_strength_threshold: Option<f64>,
+    aggressive_unwind_bps: Option<f64>,
     post_fill_spread_mult: Option<f64>,
     post_fill_decay_secs: Option<u64>,
     inventory_spread_mult: Option<f64>,
@@ -149,6 +151,9 @@ pub struct MmConfig {
     pub ema_long_periods: usize,
     /// EMA trend strength threshold in bps: pause BOTH sides when |EMA_short - EMA_long| exceeds this
     pub trend_strength_threshold: f64,
+    /// When holding inventory, place unwind order at entry_price ± this bps (0 = disabled)
+    /// Ensures minimum profit on unwind while being more aggressive than normal spread
+    pub aggressive_unwind_bps: f64,
     /// Spread multiplier immediately after a fill (decays over time)
     pub post_fill_spread_mult: f64,
     /// Seconds for post-fill spread boost to decay back to 1.0
@@ -228,6 +233,9 @@ impl MmConfig {
             trend_strength_threshold: yaml
                 .trend_strength_threshold
                 .unwrap_or(DEFAULT_TREND_STRENGTH_THRESHOLD),
+            aggressive_unwind_bps: yaml
+                .aggressive_unwind_bps
+                .unwrap_or(DEFAULT_AGGRESSIVE_UNWIND_BPS),
             post_fill_spread_mult: yaml
                 .post_fill_spread_mult
                 .unwrap_or(DEFAULT_POST_FILL_SPREAD_MULT),
@@ -297,6 +305,10 @@ impl MmConfig {
             trend_strength_threshold: parse_env(
                 "TREND_STRENGTH_THRESHOLD",
                 DEFAULT_TREND_STRENGTH_THRESHOLD,
+            ),
+            aggressive_unwind_bps: parse_env(
+                "AGGRESSIVE_UNWIND_BPS",
+                DEFAULT_AGGRESSIVE_UNWIND_BPS,
             ),
             post_fill_spread_mult: parse_env(
                 "POST_FILL_SPREAD_MULT",
@@ -370,6 +382,8 @@ pub struct MmEngine {
     last_force_close: Option<Instant>,
     /// Cached funding rate (refreshed with equity)
     cached_funding_rate: f64,
+    /// Entry price of current position (from exchange)
+    position_entry_price: Option<f64>,
     /// EMA short value for trend detection
     ema_short: Option<f64>,
     /// EMA long value for trend detection
@@ -446,6 +460,7 @@ impl MmEngine {
             in_maintenance_wind_down: false,
             last_force_close: None,
             cached_funding_rate: 0.0,
+            position_entry_price: None,
             ema_short: None,
             ema_long: None,
             last_fill_time: None,
@@ -883,12 +898,39 @@ impl MmEngine {
         let mut new_bid_ids = Vec::new();
         let mut new_ask_ids = Vec::new();
 
+        // Compute aggressive unwind prices if we have a position and feature is enabled
+        let aggressive_unwind_ask = if self.inventory > 0.0
+            && self.cfg.aggressive_unwind_bps > 0.0
+        {
+            self.position_entry_price.map(|ep| ep * (1.0 + self.cfg.aggressive_unwind_bps / 10_000.0))
+        } else {
+            None
+        };
+        let aggressive_unwind_bid = if self.inventory < 0.0
+            && self.cfg.aggressive_unwind_bps > 0.0
+        {
+            self.position_entry_price.map(|ep| ep * (1.0 - self.cfg.aggressive_unwind_bps / 10_000.0))
+        } else {
+            None
+        };
+
         // Place bid orders (buy side)
         if quote_bid {
             for level in 0..self.cfg.order_levels {
                 let level_extra_bps = level as f64 * self.cfg.level_spacing_bps;
                 let total_offset = bid_offset_bps + level_extra_bps;
-                let bid_price = mid * (1.0 - total_offset / 10_000.0);
+                let mut bid_price = mid * (1.0 - total_offset / 10_000.0);
+
+                // Aggressive unwind: if short, raise bid toward entry to close faster
+                if let Some(unwind_price) = aggressive_unwind_bid {
+                    if unwind_price > bid_price {
+                        log::info!(
+                            "[MM] BID aggressive unwind: {:.2} → {:.2} (entry={:.2})",
+                            bid_price, unwind_price, self.position_entry_price.unwrap_or(0.0)
+                        );
+                        bid_price = unwind_price;
+                    }
+                }
 
                 if bid_price <= 0.0 {
                     continue;
@@ -941,7 +983,18 @@ impl MmEngine {
             for level in 0..self.cfg.order_levels {
                 let level_extra_bps = level as f64 * self.cfg.level_spacing_bps;
                 let total_offset = ask_offset_bps + level_extra_bps;
-                let ask_price = mid * (1.0 + total_offset / 10_000.0);
+                let mut ask_price = mid * (1.0 + total_offset / 10_000.0);
+
+                // Aggressive unwind: if long, lower ask toward entry to close faster
+                if let Some(unwind_price) = aggressive_unwind_ask {
+                    if unwind_price < ask_price {
+                        log::info!(
+                            "[MM] ASK aggressive unwind: {:.2} → {:.2} (entry={:.2})",
+                            ask_price, unwind_price, self.position_entry_price.unwrap_or(0.0)
+                        );
+                        ask_price = unwind_price;
+                    }
+                }
 
                 if ask_price <= 0.0 {
                     continue;
@@ -1001,7 +1054,7 @@ impl MmEngine {
         // 10. Log status
         let total_equity = equity + self.hedge_equity_cache;
         log::info!(
-            "[MM] mid={:.2} equity={:.2} hedge_equity={:.2} total_equity={:.2} inv={:.6} hedge={:.6} net_exposure={:.6} spread_bps={:.1} skew_bps={:.1} pnl_realized={:.4} trades={} bids_filled={} asks_filled={}",
+            "[MM] mid={:.2} equity={:.2} hedge_equity={:.2} total_equity={:.2} inv={:.6} hedge={:.6} net_exposure={:.6} spread_bps={:.1} skew_bps={:.1} pnl_realized={:.4} trades={} bids_filled={} asks_filled={} entry={:.2}",
             mid,
             equity,
             self.hedge_equity_cache,
@@ -1015,6 +1068,7 @@ impl MmEngine {
             self.total_trades,
             self.total_bid_fills,
             self.total_ask_fills,
+            self.position_entry_price.unwrap_or(0.0),
         );
 
         // 11. Write dashboard status
@@ -1098,8 +1152,10 @@ impl MmEngine {
                 if let Some(p) = pos {
                     let size_f = p.size.to_f64().unwrap_or(0.0);
                     self.inventory = if p.sign > 0 { size_f } else { -size_f };
+                    self.position_entry_price = p.entry_price.and_then(|ep| ep.to_f64());
                 } else {
                     self.inventory = 0.0;
+                    self.position_entry_price = None;
                 }
             }
             Err(e) => {
