@@ -816,6 +816,11 @@ impl MmEngine {
             return Ok(());
         }
 
+        if spread_bps > self.cfg.max_spread_bps {
+            log::info!("[CAPTURE] spread={:.1}bps > max={:.1}bps, skipping (OB gap)", spread_bps, self.cfg.max_spread_bps);
+            return Ok(());
+        }
+
         // Check EMA trend - skip during strong trends
         let ema_trend = self.compute_ema_trend_bps();
         if ema_trend.abs() > self.cfg.trend_strength_threshold {
