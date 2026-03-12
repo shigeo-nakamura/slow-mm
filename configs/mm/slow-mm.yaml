@@ -1,6 +1,8 @@
 symbol: LIT
 dry_run: false
 strategy_mode: passive_mm
+price_decimals: 4              # LIT: $1.1050 (0.0001 tick)
+size_decimals: 2               # LIT: 209.42 (0.01 step)
 
 # Timing
 interval_secs: 10             # 10s cycle — LIT moves fast, need frequent requotes

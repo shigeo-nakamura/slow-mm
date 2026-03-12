@@ -53,6 +53,8 @@ const DEFAULT_CAPTURE_MIN_SPREAD_BPS: f64 = 5.0;
 const DEFAULT_CAPTURE_CLOSE_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_CAPTURE_SCAN_INTERVAL_SECS: u64 = 10;
 const DEFAULT_CAPTURE_POLL_INTERVAL_SECS: u64 = 2;
+const DEFAULT_PRICE_DECIMALS: u32 = 1;
+const DEFAULT_SIZE_DECIMALS: u32 = 5;
 
 // ---------------------------------------------------------------------------
 // YAML config
@@ -100,6 +102,8 @@ struct MmYaml {
     capture_close_timeout_secs: Option<u64>,
     capture_scan_interval_secs: Option<u64>,
     capture_poll_interval_secs: Option<u64>,
+    price_decimals: Option<u32>,
+    size_decimals: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +183,10 @@ pub struct MmConfig {
     pub capture_scan_interval_secs: u64,
     /// Seconds between fill-poll checks (MakerPending/ClosePending phase)
     pub capture_poll_interval_secs: u64,
+    /// Decimal places for price rounding (e.g. 1 for BTC $70000.0, 4 for LIT $1.1050)
+    pub price_decimals: u32,
+    /// Decimal places for size rounding (e.g. 5 for BTC 0.00100, 2 for LIT 209.42)
+    pub size_decimals: u32,
 }
 
 impl MmConfig {
@@ -279,6 +287,8 @@ impl MmConfig {
             capture_poll_interval_secs: yaml
                 .capture_poll_interval_secs
                 .unwrap_or(DEFAULT_CAPTURE_POLL_INTERVAL_SECS),
+            price_decimals: yaml.price_decimals.unwrap_or(DEFAULT_PRICE_DECIMALS),
+            size_decimals: yaml.size_decimals.unwrap_or(DEFAULT_SIZE_DECIMALS),
         };
         cfg.apply_env_overrides();
         Ok(cfg)
@@ -374,6 +384,8 @@ impl MmConfig {
                 "CAPTURE_POLL_INTERVAL_SECS",
                 DEFAULT_CAPTURE_POLL_INTERVAL_SECS,
             ),
+            price_decimals: parse_env("PRICE_DECIMALS", DEFAULT_PRICE_DECIMALS),
+            size_decimals: parse_env("SIZE_DECIMALS", DEFAULT_SIZE_DECIMALS),
         };
         cfg.apply_env_overrides();
         Ok(cfg)
@@ -2212,15 +2224,14 @@ impl MmEngine {
     // -----------------------------------------------------------------------
 
     fn round_price(&self, price: f64) -> Decimal {
-        // Round to 1 decimal place for BTC (Lighter uses specific tick sizes)
-        // This should be adapted per-symbol
         Decimal::from_f64(price)
             .unwrap_or(Decimal::ZERO)
-            .round_dp(1)
+            .round_dp(self.cfg.price_decimals)
     }
 
     fn round_size(&self, size: f64) -> Decimal {
-        // Round to 5 decimal places for BTC
-        Decimal::from_f64(size).unwrap_or(Decimal::ZERO).round_dp(5)
+        Decimal::from_f64(size)
+            .unwrap_or(Decimal::ZERO)
+            .round_dp(self.cfg.size_decimals)
     }
 }
