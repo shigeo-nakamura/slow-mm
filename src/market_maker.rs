@@ -509,9 +509,15 @@ pub struct MmEngine {
 
 impl MmEngine {
     pub async fn new(cfg: MmConfig) -> Result<Self> {
-        let tokens = vec![cfg.symbol.clone()];
+        let use_spot_hedge = !cfg.spot_hedge_symbol.is_empty();
 
-        // Create main connector
+        // Token list: include spot symbol so main_conn can trade both perp and spot
+        let mut tokens = vec![cfg.symbol.clone()];
+        if use_spot_hedge {
+            tokens.push(cfg.spot_hedge_symbol.clone());
+        }
+
+        // Create main connector (handles both perp and spot via single nonce sequence)
         let main_conn = DexConnectorBox::create_lighter("", cfg.dry_run, &tokens)
             .await
             .context("failed to create main connector")?;
@@ -525,31 +531,25 @@ impl MmEngine {
             log::warn!("[INIT] Failed to set leverage on main: {:?}", e);
         }
 
-        // Create hedge connector if enabled (spot hedge or sub-account hedge)
-        let use_spot_hedge = !cfg.spot_hedge_symbol.is_empty();
-        let hedge_conn = if cfg.hedge_enabled || use_spot_hedge {
-            let hedge_tokens = if use_spot_hedge {
-                vec![cfg.spot_hedge_symbol.clone()]
-            } else {
-                tokens.clone()
-            };
-            // Spot hedge uses same account (no HEDGE_ prefix), sub-account hedge uses HEDGE_ prefix
-            let prefix = if use_spot_hedge { "" } else { "HEDGE_" };
-            match DexConnectorBox::create_lighter(prefix, cfg.dry_run, &hedge_tokens).await {
+        if use_spot_hedge {
+            log::info!(
+                "[INIT] Spot hedge enabled: {} (using main connector, no separate hedge_conn)",
+                cfg.spot_hedge_symbol
+            );
+        }
+
+        // Create hedge connector only for legacy sub-account hedge (NOT spot hedge)
+        let hedge_conn = if cfg.hedge_enabled && !use_spot_hedge {
+            match DexConnectorBox::create_lighter("HEDGE_", cfg.dry_run, &tokens).await {
                 Ok(hc) => {
                     if let Err(e) = hc.start().await {
                         log::error!("[INIT] Failed to start hedge connector: {:?}", e);
                         None
                     } else {
-                        if !use_spot_hedge {
-                            if let Err(e) = hc.set_leverage(&cfg.symbol, cfg.max_leverage).await {
-                                log::warn!("[INIT] Failed to set leverage on hedge: {:?}", e);
-                            }
+                        if let Err(e) = hc.set_leverage(&cfg.symbol, cfg.max_leverage).await {
+                            log::warn!("[INIT] Failed to set leverage on hedge: {:?}", e);
                         }
-                        log::info!(
-                            "[INIT] Hedge connector ready ({})",
-                            if use_spot_hedge { &cfg.spot_hedge_symbol } else { "sub-account" }
-                        );
+                        log::info!("[INIT] Hedge connector ready (sub-account)");
                         Some(Arc::new(hc) as Arc<dyn DexConnector + Send + Sync>)
                     }
                 }
@@ -660,6 +660,17 @@ impl MmEngine {
                 .await
             {
                 log::warn!("[MM] Failed to close hedge positions on startup: {:?}", e);
+            }
+        }
+        // Cancel any stale spot hedge orders on startup
+        if !self.cfg.spot_hedge_symbol.is_empty() {
+            log::info!("[MM] Cancelling spot hedge orders on startup...");
+            if let Err(e) = self
+                .main_conn
+                .cancel_all_orders(Some(self.cfg.spot_hedge_symbol.clone()))
+                .await
+            {
+                log::warn!("[MM] Failed to cancel spot hedge orders on startup: {:?}", e);
             }
         }
         self.inventory = 0.0;
@@ -1200,6 +1211,17 @@ impl MmEngine {
         {
             log::warn!("[MM] Failed to close main positions: {:?}", e);
         }
+        // Cancel spot hedge orders on shutdown (via main_conn)
+        if !self.cfg.spot_hedge_symbol.is_empty() {
+            log::info!("[MM] Cancelling spot hedge orders...");
+            if let Err(e) = self
+                .main_conn
+                .cancel_all_orders(Some(self.cfg.spot_hedge_symbol.clone()))
+                .await
+            {
+                log::warn!("[MM] Failed to cancel spot hedge orders: {:?}", e);
+            }
+        }
         if let Some(ref hedge) = self.hedge_conn {
             log::info!("[MM] Cancelling hedge orders...");
             if let Err(e) = hedge
@@ -1244,7 +1266,18 @@ impl MmEngine {
                 log::warn!("[MM] Failed to close main positions for maintenance: {:?}", e);
             }
 
-            // Close hedge positions
+            // Cancel spot hedge orders for maintenance
+            if !self.cfg.spot_hedge_symbol.is_empty() {
+                if let Err(e) = self
+                    .main_conn
+                    .cancel_all_orders(Some(self.cfg.spot_hedge_symbol.clone()))
+                    .await
+                {
+                    log::warn!("[MM] Failed to cancel spot hedge orders for maintenance: {:?}", e);
+                }
+            }
+
+            // Close hedge positions (legacy sub-account)
             if let Some(ref hedge) = self.hedge_conn {
                 if let Err(e) = hedge
                     .cancel_all_orders(Some(self.cfg.symbol.clone()))
@@ -1697,7 +1730,8 @@ impl MmEngine {
         self.last_order_time = Some(Instant::now());
 
         // 9. Manage hedge position
-        if self.cfg.hedge_enabled && self.hedge_conn.is_some() {
+        let use_spot_hedge = !self.cfg.spot_hedge_symbol.is_empty();
+        if use_spot_hedge || (self.cfg.hedge_enabled && self.hedge_conn.is_some()) {
             self.manage_hedge(max_inventory_tokens, order_size_tokens).await;
         }
 
@@ -1813,22 +1847,26 @@ impl MmEngine {
             }
         }
 
-        // Sync hedge position
-        if let Some(ref hedge) = self.hedge_conn {
-            match hedge.get_positions().await {
-                Ok(positions) => {
-                    let pos = positions
-                        .iter()
-                        .find(|p| p.symbol == self.cfg.symbol && p.size > Decimal::ZERO);
-                    if let Some(p) = pos {
-                        let size_f = p.size.to_f64().unwrap_or(0.0);
-                        self.hedge_position = if p.sign > 0 { size_f } else { -size_f };
-                    } else {
-                        self.hedge_position = 0.0;
+        // Sync hedge position (only for legacy sub-account hedge, NOT spot hedge)
+        // Spot hedge tracks position via fill accumulation (hedge_position field)
+        // because spot "positions" are token balances, not perp positions.
+        if self.cfg.spot_hedge_symbol.is_empty() {
+            if let Some(ref hedge) = self.hedge_conn {
+                match hedge.get_positions().await {
+                    Ok(positions) => {
+                        let pos = positions
+                            .iter()
+                            .find(|p| p.symbol == self.cfg.symbol && p.size > Decimal::ZERO);
+                        if let Some(p) = pos {
+                            let size_f = p.size.to_f64().unwrap_or(0.0);
+                            self.hedge_position = if p.sign > 0 { size_f } else { -size_f };
+                        } else {
+                            self.hedge_position = 0.0;
+                        }
                     }
-                }
-                Err(e) => {
-                    log::warn!("[MM] Failed to get hedge positions: {:?}", e);
+                    Err(e) => {
+                        log::warn!("[MM] Failed to get hedge positions: {:?}", e);
+                    }
                 }
             }
         }
@@ -1984,11 +2022,6 @@ impl MmEngine {
     /// Spot hedge: keep delta-neutral by hedging full perp inventory on spot.
     /// Sub-account hedge: threshold-based hedging (legacy).
     async fn manage_hedge(&mut self, _max_inventory_tokens: f64, _order_size_tokens: f64) {
-        let hedge_conn = match &self.hedge_conn {
-            Some(c) => c.clone(),
-            None => return,
-        };
-
         let mid = self.last_mid.unwrap_or(0.0);
         if mid <= 0.0 {
             return;
@@ -1997,8 +2030,8 @@ impl MmEngine {
         let use_spot_hedge = !self.cfg.spot_hedge_symbol.is_empty();
 
         if use_spot_hedge {
-            // Spot hedge: target = -inventory (opposite of perp position)
-            // hedge_position tracks current spot position (positive = long spot)
+            // Spot hedge via main_conn (single nonce sequence, no conflicts)
+            // hedge_position tracks cumulative spot hedge (negative = sold spot tokens)
             let target_hedge = -self.inventory; // perp long → spot short, perp short → spot long
             let delta = target_hedge - self.hedge_position;
             if delta.abs() < 1.0 {
@@ -2017,18 +2050,21 @@ impl MmEngine {
                 "[SPOT-HEDGE] inv={:.2} hedge={:.2} target={:.2} delta={:.2} {:?} size={}",
                 self.inventory, self.hedge_position, target_hedge, delta, side, size
             );
-            match hedge_conn
+            match self.main_conn
                 .create_order(&self.cfg.spot_hedge_symbol, size, side, None, None, false, None)
                 .await
             {
                 Ok(_) => {
                     log::info!("[SPOT-HEDGE] Placed: {:?} {} size={}", side, self.cfg.spot_hedge_symbol, size);
-                    // Update hedge position estimate (will be corrected by sync)
                     self.hedge_position += delta;
                 }
                 Err(e) => log::error!("[SPOT-HEDGE] Failed: {:?}", e),
             }
         } else {
+            let hedge_conn = match &self.hedge_conn {
+                Some(c) => c.clone(),
+                None => return,
+            };
             // Legacy sub-account hedge with threshold
             let net_exposure = self.inventory + self.hedge_position;
             let exposure_usd = net_exposure.abs() * mid;
@@ -2162,38 +2198,35 @@ impl MmEngine {
         );
 
         // Instant hedge on fill detection
-        if self.hedge_conn.is_some() {
-            let use_spot_hedge = !self.cfg.spot_hedge_symbol.is_empty();
-            let hedge_conn = self.hedge_conn.as_ref().unwrap().clone();
-
-            if use_spot_hedge {
-                // Spot hedge: immediately hedge the fill delta (opposite direction on spot)
-                // Perp Long fill → Spot Short (sell), Perp Short fill → Spot Long (buy)
-                let hedge_side = if fill_delta > 0.0 {
-                    OrderSide::Short // bought perp → sell spot
-                } else {
-                    OrderSide::Long // sold perp → buy spot
-                };
-                let hedge_size = self.round_size(fill_delta.abs());
-                if hedge_size > Decimal::ZERO {
-                    log::info!(
-                        "[SPOT-HEDGE-RT] Perp fill {:+.2} → spot {:?} {} size={}",
-                        fill_delta, hedge_side, self.cfg.spot_hedge_symbol, hedge_size
-                    );
-                    match hedge_conn
-                        .create_order(&self.cfg.spot_hedge_symbol, hedge_size, hedge_side, None, None, false, None)
-                        .await
-                    {
-                        Ok(_) => {
-                            log::info!("[SPOT-HEDGE-RT] Placed: {:?} size={}", hedge_side, hedge_size);
-                            self.hedge_position -= fill_delta; // opposite of perp
-                        }
-                        Err(e) => {
-                            log::error!("[SPOT-HEDGE-RT] Failed: {:?}", e);
-                        }
+        let use_spot_hedge = !self.cfg.spot_hedge_symbol.is_empty();
+        if use_spot_hedge {
+            // Spot hedge via main_conn: immediately hedge the fill delta (opposite direction on spot)
+            let hedge_side = if fill_delta > 0.0 {
+                OrderSide::Short // bought perp → sell spot
+            } else {
+                OrderSide::Long // sold perp → buy spot
+            };
+            let hedge_size = self.round_size(fill_delta.abs());
+            if hedge_size > Decimal::ZERO {
+                log::info!(
+                    "[SPOT-HEDGE-RT] Perp fill {:+.2} → spot {:?} {} size={}",
+                    fill_delta, hedge_side, self.cfg.spot_hedge_symbol, hedge_size
+                );
+                match self.main_conn
+                    .create_order(&self.cfg.spot_hedge_symbol, hedge_size, hedge_side, None, None, false, None)
+                    .await
+                {
+                    Ok(_) => {
+                        log::info!("[SPOT-HEDGE-RT] Placed: {:?} size={}", hedge_side, hedge_size);
+                        self.hedge_position -= fill_delta; // opposite of perp
+                    }
+                    Err(e) => {
+                        log::error!("[SPOT-HEDGE-RT] Failed: {:?}", e);
                     }
                 }
-            } else if self.cfg.hedge_enabled {
+            }
+        } else if self.cfg.hedge_enabled {
+            if let Some(ref hedge_conn) = self.hedge_conn {
                 // Legacy sub-account hedge with threshold
                 let net_exposure = self.inventory + self.hedge_position;
                 let mid = self.last_mid.unwrap_or(0.0);
@@ -2275,6 +2308,20 @@ impl MmEngine {
                 }
             }
         }
+        // Report spot hedge position from tracking (not from exchange)
+        if !self.cfg.spot_hedge_symbol.is_empty() && self.hedge_position.abs() > 0.01 {
+            result.push(PositionInfo {
+                symbol: format!("{}_SPOT_HEDGE", self.cfg.spot_hedge_symbol),
+                side: if self.hedge_position > 0.0 {
+                    "long".to_string()
+                } else {
+                    "short".to_string()
+                },
+                size: format!("{:.2}", self.hedge_position.abs()),
+                entry_price: None,
+            });
+        }
+        // Legacy sub-account hedge positions
         if let Some(ref hedge) = self.hedge_conn {
             if let Ok(positions) = hedge.get_positions().await {
                 for p in &positions {
