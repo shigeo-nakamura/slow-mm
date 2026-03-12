@@ -414,7 +414,7 @@ enum CapturePhase {
         size: f64,
         placed_at: Instant,
     },
-    /// One side filled, waiting for the other side to fill
+    /// One side filled, waiting for the other side to fill (with requoting)
     OneFilled {
         remaining_order_id: String,
         filled_side: OrderSide,
@@ -423,6 +423,8 @@ enum CapturePhase {
         other_price: f64,
         other_size: f64,
         filled_at: Instant,
+        last_requote_at: Instant,
+        requote_count: u32,
     },
 }
 
@@ -731,14 +733,18 @@ impl MmEngine {
                 }
                 Ok(())
             }
-            CapturePhase::OneFilled { filled_at, filled_side, filled_price, filled_size, other_price, .. } => {
+            CapturePhase::OneFilled { filled_at, filled_side, filled_price, filled_size, other_price, other_size, last_requote_at, requote_count, .. } => {
                 self.capture_check_close_fill().await?;
-                // If still waiting and timed out, force close with market
+                // If still waiting, check for requote or force close
                 if matches!(self.capture_state.phase, CapturePhase::OneFilled { .. }) {
                     if filled_at.elapsed().as_secs() > self.cfg.capture_close_timeout_secs {
-                        log::warn!("[CAPTURE] Close side timeout ({}s), force closing", self.cfg.capture_close_timeout_secs);
+                        // Final timeout: force close with market
+                        log::warn!("[CAPTURE] Final timeout ({}s, {} requotes), force closing", self.cfg.capture_close_timeout_secs, requote_count);
                         let _ = self.main_conn.cancel_all_orders(Some(self.cfg.symbol.clone())).await;
                         self.capture_force_close(filled_side, filled_price, filled_size, other_price).await?;
+                    } else if last_requote_at.elapsed().as_secs() >= 10 {
+                        // Requote every 10 seconds at current best price
+                        self.capture_requote(filled_side, filled_price, filled_size, other_size, filled_at, requote_count).await?;
                     }
                 }
                 Ok(())
@@ -922,6 +928,7 @@ impl MmEngine {
         );
 
         // Don't cancel the other order - let it fill!
+        let now = Instant::now();
         self.capture_state.phase = CapturePhase::OneFilled {
             remaining_order_id: String::new(), // not tracking individual IDs
             filled_side: side,
@@ -929,7 +936,9 @@ impl MmEngine {
             filled_size: total_size,
             other_price,
             other_size,
-            filled_at: Instant::now(),
+            filled_at: now,
+            last_requote_at: now,
+            requote_count: 0,
         };
         Ok(())
     }
@@ -981,6 +990,80 @@ impl MmEngine {
         );
 
         self.capture_state.phase = CapturePhase::Scanning;
+        Ok(())
+    }
+
+    /// Requote the close side at current best bid/ask
+    async fn capture_requote(
+        &mut self,
+        filled_side: OrderSide,
+        filled_price: f64,
+        filled_size: f64,
+        other_size: f64,
+        filled_at: Instant,
+        requote_count: u32,
+    ) -> Result<()> {
+        // Cancel existing close order
+        let _ = self.main_conn.cancel_all_orders(Some(self.cfg.symbol.clone())).await;
+
+        // Get current OB for best price
+        let ob = self
+            .main_conn
+            .get_order_book(&self.cfg.symbol, self.cfg.ob_depth)
+            .await
+            .context("failed to get order book for requote")?;
+
+        let best_bid = ob.bids.first().map(|l| l.price.to_f64().unwrap_or(0.0)).unwrap_or(0.0);
+        let best_ask = ob.asks.first().map(|l| l.price.to_f64().unwrap_or(0.0)).unwrap_or(0.0);
+
+        if best_bid <= 0.0 || best_ask <= 0.0 {
+            log::warn!("[CAPTURE] Requote: invalid OB, skipping");
+            return Ok(());
+        }
+
+        // Close side: if we bought (Long), we need to sell (Short) at best_ask
+        //             if we sold (Short), we need to buy (Long) at best_bid
+        let (close_side, close_price) = match filled_side {
+            OrderSide::Long => (OrderSide::Short, best_ask),
+            OrderSide::Short => (OrderSide::Long, best_bid),
+        };
+
+        let close_price_dec = self.round_price(close_price);
+        let size_dec = self.round_size(other_size);
+
+        if size_dec <= Decimal::ZERO || close_price_dec <= Decimal::ZERO {
+            return Ok(());
+        }
+
+        let new_count = requote_count + 1;
+        log::info!(
+            "[CAPTURE] Requote #{}: {:?}@{} (entry {:?}@{:.2}, elapsed {}s)",
+            new_count, close_side, close_price_dec, filled_side, filled_price,
+            filled_at.elapsed().as_secs()
+        );
+
+        match self.main_conn.create_order(
+            &self.cfg.symbol, size_dec, close_side,
+            Some(close_price_dec), Some(0), true, Some(self.cfg.stale_order_secs),
+        ).await {
+            Ok(_) => {
+                let now = Instant::now();
+                self.capture_state.phase = CapturePhase::OneFilled {
+                    remaining_order_id: String::new(),
+                    filled_side,
+                    filled_price,
+                    filled_size,
+                    other_price: close_price,
+                    other_size,
+                    filled_at,
+                    last_requote_at: now,
+                    requote_count: new_count,
+                };
+            }
+            Err(e) => {
+                log::error!("[CAPTURE] Requote failed: {:?}", e);
+            }
+        }
         Ok(())
     }
 
