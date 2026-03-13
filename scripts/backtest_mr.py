@@ -12,8 +12,8 @@ from itertools import product
 SYMBOL = "LIT"
 EQUITY = 290.0
 ORDER_SIZE_PCT = 0.05
-EMA_SHORT = 5
-EMA_LONG = 20
+DEFAULT_EMA_SHORT = 5
+DEFAULT_EMA_LONG = 20
 COOLDOWN_TICKS = 3
 
 def load_prices(path):
@@ -36,6 +36,8 @@ class Result:
     stop_bps: float
     tp_bps: float
     revert_bps: float  # close when EMA converges within this
+    ema_short: int
+    ema_long: int
     trades: int
     wins: int
     pnl: float
@@ -43,11 +45,14 @@ class Result:
     avg_hold_ticks: float
     trades_per_10min: float
 
-def run_backtest(prices, entry_bps, stop_bps, tp_bps, revert_bps):
+def run_backtest(prices, entry_bps, stop_bps, tp_bps, revert_bps,
+                 ema_short=None, ema_long=None):
+    ema_short = ema_short or DEFAULT_EMA_SHORT
+    ema_long = ema_long or DEFAULT_EMA_LONG
     ema_s = None
     ema_l = None
-    alpha_s = 2.0 / (EMA_SHORT + 1)
-    alpha_l = 2.0 / (EMA_LONG + 1)
+    alpha_s = 2.0 / (ema_short + 1)
+    alpha_l = 2.0 / (ema_long + 1)
 
     direction = 0
     entry_price = 0.0
@@ -121,7 +126,8 @@ def run_backtest(prices, entry_bps, stop_bps, tp_bps, revert_bps):
 
     return Result(
         entry_bps=entry_bps, stop_bps=stop_bps, tp_bps=tp_bps,
-        revert_bps=revert_bps, trades=trades, wins=wins, pnl=pnl,
+        revert_bps=revert_bps, ema_short=ema_short, ema_long=ema_long,
+        trades=trades, wins=wins, pnl=pnl,
         max_dd=max_dd, avg_hold_ticks=avg_hold,
         trades_per_10min=trades_per_10min,
     )
@@ -138,14 +144,18 @@ def main():
     stop_list = [5.0, 10.0, 15.0, 20.0, 30.0]
     tp_list = [3.0, 5.0, 8.0, 10.0, 15.0, 20.0]
     revert_list = [0.5, 1.0, 2.0, 3.0, 5.0]
+    ema_short_list = [5, 10, 20]
+    ema_long_list = [20, 40, 80]
+    ema_pairs = [(s, l) for s in ema_short_list for l in ema_long_list if l > s]
 
-    total = len(entry_list) * len(stop_list) * len(tp_list) * len(revert_list)
-    print(f"Running {total} combinations...")
+    total = len(entry_list) * len(stop_list) * len(tp_list) * len(revert_list) * len(ema_pairs)
+    print(f"Running {total} combinations ({len(ema_pairs)} EMA pairs)...")
 
     results = []
-    for e, s, t, r in product(entry_list, stop_list, tp_list, revert_list):
-        res = run_backtest(prices, e, s, t, r)
-        results.append(res)
+    for es, el in ema_pairs:
+        for e, s, t, r in product(entry_list, stop_list, tp_list, revert_list):
+            res = run_backtest(prices, e, s, t, r, ema_short=es, ema_long=el)
+            results.append(res)
 
     # Filter by frequency
     freq_ok = [r for r in results if r.trades_per_10min >= 1.0]
@@ -159,14 +169,14 @@ def main():
 
     freq_ok.sort(key=lambda r: -r.pnl)
 
-    print(f"\n{'='*110}")
-    print(f"{'entry':>6} {'stop':>6} {'tp':>6} {'revert':>6} | {'trades':>7} {'wins':>5} {'winR':>5} | {'PnL':>8} {'maxDD':>7} | {'t/10m':>6} {'avgHold':>7}")
-    print(f"{'='*110}")
+    print(f"\n{'='*130}")
+    print(f"{'EMA':>7} {'entry':>6} {'stop':>6} {'tp':>6} {'revert':>6} | {'trades':>7} {'wins':>5} {'winR':>5} | {'PnL':>8} {'maxDD':>7} | {'t/10m':>6} {'avgHold':>7}")
+    print(f"{'='*130}")
     for r in freq_ok[:40]:
         wr = r.wins / r.trades * 100 if r.trades > 0 else 0
         hs = r.avg_hold_ticks * 20
         print(
-            f"{r.entry_bps:>6.1f} {r.stop_bps:>6.1f} {r.tp_bps:>6.1f} {r.revert_bps:>6.1f} | "
+            f"{r.ema_short:>2}/{r.ema_long:<3} {r.entry_bps:>6.1f} {r.stop_bps:>6.1f} {r.tp_bps:>6.1f} {r.revert_bps:>6.1f} | "
             f"{r.trades:>7} {r.wins:>5} {wr:>4.0f}% | "
             f"${r.pnl:>7.2f} ${r.max_dd:>6.2f} | "
             f"{r.trades_per_10min:>5.2f} {hs:>6.0f}s"
@@ -175,7 +185,7 @@ def main():
     profitable = [r for r in freq_ok if r.pnl > 0]
     if profitable:
         best = profitable[0]
-        print(f"\n*** BEST: entry={best.entry_bps} stop={best.stop_bps} tp={best.tp_bps} revert={best.revert_bps}")
+        print(f"\n*** BEST: ema={best.ema_short}/{best.ema_long} entry={best.entry_bps} stop={best.stop_bps} tp={best.tp_bps} revert={best.revert_bps}")
         print(f"    PnL=${best.pnl:.2f} trades={best.trades} winRate={best.wins/best.trades*100:.0f}% maxDD=${best.max_dd:.2f} freq={best.trades_per_10min:.2f}/10min")
     else:
         print("\n*** No profitable mean-reversion combo found either")

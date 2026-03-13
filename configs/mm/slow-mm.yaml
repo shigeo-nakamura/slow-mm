@@ -25,8 +25,9 @@ tf_take_profit_bps: 15.0      # Take profit at +15bps (> spread cost)
 mr_revert_bps: 3.0            # Close when EMA converges within 3bps
 tf_cooldown_secs: 60          # 60s cooldown after close
 
-# Trend pause: 0 = disabled. Set to e.g. 80 to pause during strong trends.
-mr_trend_pause_bps: 0
+# Trend pause: skip MR entry when macro EMA divergence exceeds this threshold.
+# Prevents counter-trend entries during strong directional moves.
+mr_trend_pause_bps: 50
 
 # Passive MM settings (unused, kept for fallback)
 spread_bps: 25

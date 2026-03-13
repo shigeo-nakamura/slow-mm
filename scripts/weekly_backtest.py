@@ -16,7 +16,8 @@ import yaml
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(__file__))
-from backtest_lib import load_ticks, precompute_emas, backtest_mr, result_dict
+from backtest_lib import (load_ticks, precompute_emas, backtest_mr,
+                          backtest_mr_trend_pause, result_dict)
 
 # Defaults
 DATA_FILE = os.getenv(
@@ -55,6 +56,9 @@ def update_yaml_params(config_path, params, old_result, new_result):
         "stop_loss_bps": float(params["stop"]),
         "tf_take_profit_bps": float(params["tp"]),
         "mr_revert_bps": float(params["revert"]),
+        "ema_short_periods": int(params.get("ema_short", 5)),
+        "ema_long_periods": int(params.get("ema_long", 20)),
+        "mr_trend_pause_bps": int(params.get("macro_pause", 0)),
     }
     for key, val in replacements.items():
         content = re.sub(
@@ -98,6 +102,9 @@ def main():
     max_spread = cfg.get("max_spread_bps", 50.0)
     equity = cfg.get("equity_usd_fallback", 500.0)
     order_size_pct = cfg.get("order_size_pct", 0.10)
+    ema_short = cfg.get("ema_short_periods", 5)
+    ema_long = cfg.get("ema_long_periods", 20)
+    macro_pause_bps = cfg.get("mr_trend_pause_bps", 0)
 
     print(f"[BACKTEST] Loading data: {data_file} (last {LOOKBACK_DAYS} days, max_spread={max_spread}bps)")
     prices, stats = load_ticks(data_file, max_spread_bps=max_spread, lookback_days=LOOKBACK_DAYS)
@@ -108,38 +115,71 @@ def main():
         print("[BACKTEST] Not enough data, skipping")
         return
 
-    trend_bps_arr, _ = precompute_emas(prices)
+    trend_bps_arr, macro_bps_arr = precompute_emas(prices, ema_short, ema_long)
 
     # Run with current config
-    trades, wins, pnl, max_dd, _ = backtest_mr(
-        prices, trend_bps_arr, entry_bps, stop_bps, tp_bps, revert_bps,
-        equity=equity, order_size_pct=order_size_pct,
-    )
+    if macro_pause_bps > 0:
+        trades, wins, pnl, max_dd, _ = backtest_mr_trend_pause(
+            prices, trend_bps_arr, macro_bps_arr,
+            entry_bps, stop_bps, tp_bps, revert_bps, macro_pause_bps,
+            equity=equity, order_size_pct=order_size_pct,
+        )
+    else:
+        trades, wins, pnl, max_dd, _ = backtest_mr(
+            prices, trend_bps_arr, entry_bps, stop_bps, tp_bps, revert_bps,
+            equity=equity, order_size_pct=order_size_pct,
+        )
     result = result_dict(prices, trades, wins, pnl, max_dd)
     print(f"[BACKTEST] Current config: PnL=${result['pnl']} winR={result['win_rate']}% "
-          f"trades={result['trades']} maxDD=${result['max_dd']} freq={result['trades_per_10min']}/10m")
+          f"trades={result['trades']} maxDD=${result['max_dd']} freq={result['trades_per_10min']}/10m "
+          f"ema={ema_short}/{ema_long} pause={macro_pause_bps}bps")
 
-    # Grid search for best params
+    # Grid search for best params (including EMA periods and trend pause)
     best_pnl = result["pnl"]
-    best_params = {"entry": entry_bps, "stop": stop_bps, "tp": tp_bps, "revert": revert_bps}
-    for e in [5, 10, 15, 20, 30]:
-        for s in [10, 20, 30, 50]:
-            for t in [3, 5, 8, 10, 15, 20]:
-                for r in [3, 5, 10]:
-                    tr, wi, pn, md, _ = backtest_mr(
-                        prices, trend_bps_arr, e, s, t, r,
-                        equity=equity, order_size_pct=order_size_pct,
-                    )
-                    res = result_dict(prices, tr, wi, pn, md)
-                    if res["trades_per_10min"] >= 0.5 and res["pnl"] > best_pnl:
-                        best_pnl = res["pnl"]
-                        best_params = {"entry": e, "stop": s, "tp": t, "revert": r}
+    best_params = {"entry": entry_bps, "stop": stop_bps, "tp": tp_bps, "revert": revert_bps,
+                   "ema_short": ema_short, "ema_long": ema_long, "macro_pause": macro_pause_bps}
 
-    best_trades, best_wins, best_pnl_val, best_max_dd, _ = backtest_mr(
-        prices, trend_bps_arr,
-        best_params["entry"], best_params["stop"], best_params["tp"], best_params["revert"],
-        equity=equity, order_size_pct=order_size_pct,
-    )
+    ema_short_list = [5, 10, 20]
+    ema_long_list = [20, 40, 80]
+    macro_pause_list = [0, 30, 50, 80]
+
+    for es, el in [(s, l) for s in ema_short_list for l in ema_long_list if l > s]:
+        t_arr, m_arr = precompute_emas(prices, es, el)
+        for e in [5, 10, 15, 20, 30]:
+            for s in [10, 20, 30, 50]:
+                for t in [3, 5, 8, 10, 15, 20]:
+                    for r in [3, 5, 10]:
+                        for mp in macro_pause_list:
+                            if mp > 0:
+                                tr, wi, pn, md, _ = backtest_mr_trend_pause(
+                                    prices, t_arr, m_arr, e, s, t, r, mp,
+                                    equity=equity, order_size_pct=order_size_pct,
+                                )
+                            else:
+                                tr, wi, pn, md, _ = backtest_mr(
+                                    prices, t_arr, e, s, t, r,
+                                    equity=equity, order_size_pct=order_size_pct,
+                                )
+                            res = result_dict(prices, tr, wi, pn, md)
+                            if res["trades_per_10min"] >= 0.5 and res["pnl"] > best_pnl:
+                                best_pnl = res["pnl"]
+                                best_params = {"entry": e, "stop": s, "tp": t, "revert": r,
+                                               "ema_short": es, "ema_long": el, "macro_pause": mp}
+
+    bp = best_params
+    t_arr, m_arr = precompute_emas(prices, bp["ema_short"], bp["ema_long"])
+    if bp["macro_pause"] > 0:
+        best_trades, best_wins, best_pnl_val, best_max_dd, _ = backtest_mr_trend_pause(
+            prices, t_arr, m_arr,
+            bp["entry"], bp["stop"], bp["tp"], bp["revert"], bp["macro_pause"],
+            equity=equity, order_size_pct=order_size_pct,
+        )
+    else:
+        best_trades, best_wins, best_pnl_val, best_max_dd, _ = backtest_mr(
+            prices, t_arr,
+            bp["entry"], bp["stop"], bp["tp"], bp["revert"],
+            equity=equity, order_size_pct=order_size_pct,
+        )
     best_result = result_dict(prices, best_trades, best_wins, best_pnl_val, best_max_dd)
 
     # Determine alert level
@@ -153,16 +193,20 @@ def main():
         alert_level = "OK"
         alert_msg = f"MR edge OK: PnL=${result['pnl']}/7d winR={result['win_rate']}%"
 
-    params_changed = best_params != {"entry": entry_bps, "stop": stop_bps, "tp": tp_bps, "revert": revert_bps}
+    current_params = {"entry": entry_bps, "stop": stop_bps, "tp": tp_bps, "revert": revert_bps,
+                      "ema_short": ema_short, "ema_long": ema_long, "macro_pause": macro_pause_bps}
+    params_changed = best_params != current_params
     if params_changed:
         alert_msg += (f" | Better params: entry={best_params['entry']} stop={best_params['stop']} "
-                      f"tp={best_params['tp']} revert={best_params['revert']} (PnL=${best_pnl})")
+                      f"tp={best_params['tp']} revert={best_params['revert']} "
+                      f"ema={best_params['ema_short']}/{best_params['ema_long']} "
+                      f"pause={best_params['macro_pause']}bps (PnL=${best_pnl})")
 
     print(f"[BACKTEST] {alert_level}: {alert_msg}")
 
     # Auto-update YAML config if better params found
     config_updated = False
-    old_params = {"entry": entry_bps, "stop": stop_bps, "tp": tp_bps, "revert": revert_bps}
+    old_params = current_params
     if params_changed and best_pnl > 0:
         try:
             update_yaml_params(config_file, best_params, result, best_result)

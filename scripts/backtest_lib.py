@@ -14,10 +14,10 @@ import json
 import time
 
 SYMBOL = "LIT"
-EMA_SHORT = 5
-EMA_LONG = 20
-EMA_MACRO_SHORT = 10
-EMA_MACRO_LONG = 50
+DEFAULT_EMA_SHORT = 5
+DEFAULT_EMA_LONG = 20
+DEFAULT_EMA_MACRO_SHORT = 10
+DEFAULT_EMA_MACRO_LONG = 50
 COOLDOWN_TICKS = 3
 
 
@@ -83,12 +83,18 @@ def load_ticks(path, max_spread_bps=50.0, lookback_days=None):
                     "skipped_wide": skipped_wide, "skipped_missing": skipped_missing}
 
 
-def precompute_emas(prices):
+def precompute_emas(prices, ema_short=None, ema_long=None,
+                    ema_macro_short=None, ema_macro_long=None):
     """Precompute EMA trend and macro arrays from price ticks."""
-    alpha_s = 2.0 / (EMA_SHORT + 1)
-    alpha_l = 2.0 / (EMA_LONG + 1)
-    alpha_ms = 2.0 / (EMA_MACRO_SHORT + 1)
-    alpha_ml = 2.0 / (EMA_MACRO_LONG + 1)
+    ema_short = ema_short or DEFAULT_EMA_SHORT
+    ema_long = ema_long or DEFAULT_EMA_LONG
+    ema_macro_short = ema_macro_short or DEFAULT_EMA_MACRO_SHORT
+    ema_macro_long = ema_macro_long or DEFAULT_EMA_MACRO_LONG
+
+    alpha_s = 2.0 / (ema_short + 1)
+    alpha_l = 2.0 / (ema_long + 1)
+    alpha_ms = 2.0 / (ema_macro_short + 1)
+    alpha_ml = 2.0 / (ema_macro_long + 1)
 
     n = len(prices)
     trend_bps = [0.0] * n
