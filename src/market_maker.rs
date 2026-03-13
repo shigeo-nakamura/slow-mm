@@ -1343,6 +1343,39 @@ impl MmEngine {
             return Ok(());
         }
         let mid = (best_bid + best_ask) / 2.0;
+        let spread_bps = (best_ask - best_bid) / mid * 10_000.0;
+
+        let wide_spread = spread_bps > self.cfg.max_spread_bps;
+
+        if wide_spread {
+            if self.tf_direction.is_some() {
+                log::warn!(
+                    "[TF] Wide spread {:.1}bps but have position, checking stop-loss only",
+                    spread_bps
+                );
+                let direction = self.tf_direction.as_ref().unwrap().clone();
+                let entry = self.tf_entry_price.unwrap_or(best_bid);
+                let exit_price = match direction {
+                    OrderSide::Long => best_bid,
+                    _ => best_ask,
+                };
+                let pnl_bps = match direction {
+                    OrderSide::Long => (exit_price - entry) / entry * 10_000.0,
+                    _ => (entry - exit_price) / entry * 10_000.0,
+                };
+                if pnl_bps <= -(self.cfg.stop_loss_bps) {
+                    log::warn!("[TF] STOP-LOSS during wide spread: pnl={:+.1}bps", pnl_bps);
+                    self.tf_close_position_market("stop_loss").await;
+                    self.tf_last_stop_time = Some(Instant::now());
+                }
+                return Ok(());
+            }
+            log::debug!(
+                "[TF] Wide spread {:.1}bps > max {:.1}bps, skipping tick",
+                spread_bps, self.cfg.max_spread_bps
+            );
+            return Ok(());
+        }
 
         // 2. Update EMA
         self.update_ema(mid);
@@ -1666,8 +1699,44 @@ impl MmEngine {
             return Ok(());
         }
         let mid = (best_bid + best_ask) / 2.0;
+        let spread_bps = (best_ask - best_bid) / mid * 10_000.0;
 
-        // 2. Update EMA
+        let wide_spread = spread_bps > self.cfg.max_spread_bps;
+
+        // If spread is wide but we have a position, still check stop-loss using best_bid
+        // (don't skip the whole tick — we need to protect the position)
+        if wide_spread {
+            if self.tf_direction.is_some() {
+                log::warn!(
+                    "[MR] Wide spread {:.1}bps but have position, checking stop-loss only (bid={:.4} ask={:.4})",
+                    spread_bps, best_bid, best_ask
+                );
+                // Use best_bid as conservative exit price for stop-loss check
+                let direction = self.tf_direction.as_ref().unwrap().clone();
+                let entry = self.tf_entry_price.unwrap_or(best_bid);
+                let exit_price = match direction {
+                    OrderSide::Long => best_bid,
+                    _ => best_ask,
+                };
+                let pnl_bps = match direction {
+                    OrderSide::Long => (exit_price - entry) / entry * 10_000.0,
+                    _ => (entry - exit_price) / entry * 10_000.0,
+                };
+                if pnl_bps <= -(self.cfg.stop_loss_bps) {
+                    log::warn!("[MR] STOP-LOSS during wide spread: pnl={:+.1}bps", pnl_bps);
+                    self.tf_close_position_market("stop_loss").await;
+                    self.tf_last_stop_time = Some(Instant::now());
+                }
+                return Ok(());
+            }
+            log::debug!(
+                "[MR] Wide spread {:.1}bps > max {:.1}bps, skipping tick (bid={:.4} ask={:.4})",
+                spread_bps, self.cfg.max_spread_bps, best_bid, best_ask
+            );
+            return Ok(());
+        }
+
+        // 2. Update EMA (only with clean mid prices)
         self.update_ema(mid);
         self.update_macro_ema(mid);
         self.last_mid = Some(mid);
