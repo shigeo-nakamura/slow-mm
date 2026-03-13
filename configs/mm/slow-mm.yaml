@@ -8,7 +8,7 @@ size_decimals: 2               # LIT: 209.42 (0.01 step)
 spot_hedge_symbol: ""
 
 # Timing
-interval_secs: 20             # 20s EMA update cycle
+interval_secs: 5              # 5s cycle for tighter stop-loss execution
 
 # Position sizing
 order_size_pct: 0.10          # 10% of equity per trade
