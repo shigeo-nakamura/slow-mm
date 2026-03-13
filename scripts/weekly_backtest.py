@@ -2,12 +2,11 @@
 """
 Weekly backtest for mean_reversion strategy.
 Reads last 7 days from market_data_365d.jsonl, runs backtest with current config,
-writes alert to debot-dashboard status directory if edge is lost.
+auto-updates YAML if better params found, writes alert to dashboard.
 
 Usage: python3 weekly_backtest.py [data_file] [config_file]
 Cron:  0 6 * * 1  python3 /opt/slow-mm/scripts/weekly_backtest.py
 """
-import json
 import os
 import re
 import shutil
@@ -15,6 +14,9 @@ import sys
 import time
 import yaml
 from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(__file__))
+from backtest_lib import load_ticks, precompute_emas, backtest_mr, result_dict
 
 # Defaults
 DATA_FILE = os.getenv(
@@ -31,110 +33,23 @@ STATUS_DIR = os.getenv(
 )
 STATUS_ID = os.getenv("DEBOT_STATUS_ID", "slow-mm")
 ALERT_FILE = os.path.join(STATUS_DIR, STATUS_ID, "backtest_alert.json")
-SYMBOL = "LIT"
-EQUITY = 290.0
-EMA_SHORT = 5
-EMA_LONG = 20
 LOOKBACK_DAYS = 7
 
-def load_prices(path, lookback_days):
-    """Load prices from JSONL, keep only last N days."""
-    prices = []
-    cutoff_ms = (time.time() - lookback_days * 86400) * 1000
-
-    with open(path) as f:
-        for line in f:
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            ts = row.get("timestamp", 0)
-            if ts < cutoff_ms:
-                continue
-            lit = row.get("prices", {}).get(SYMBOL)
-            if not lit:
-                continue
-            price = float(lit.get("price", 0))
-            if price > 0:
-                prices.append((ts, price))
-    return prices
-
-def run_backtest(prices, entry_bps, stop_bps, tp_bps, revert_bps, cooldown_ticks=3):
-    ema_s = ema_l = None
-    alpha_s = 2.0 / (EMA_SHORT + 1)
-    alpha_l = 2.0 / (EMA_LONG + 1)
-    direction = 0
-    entry_price = 0.0
-    cooldown = 0
-    trades = wins = 0
-    pnl = 0.0
-    peak_pnl = max_dd = 0.0
-    order_size_pct = 0.05
-
-    for _, mid in prices:
-        if ema_s is None:
-            ema_s = ema_l = mid
-        else:
-            ema_s = alpha_s * mid + (1 - alpha_s) * ema_s
-            ema_l = alpha_l * mid + (1 - alpha_l) * ema_l
-        trend = (ema_s - ema_l) / ema_l * 10000 if ema_l > 0 else 0
-
-        if direction != 0:
-            pnl_bps = ((mid - entry_price) / entry_price * 10000) * direction
-            close = False
-            if pnl_bps <= -stop_bps:
-                close = True
-            elif pnl_bps >= tp_bps:
-                close = True
-            elif abs(trend) <= revert_bps:
-                close = True
-            if close:
-                size_usd = EQUITY * order_size_pct
-                trade_pnl = pnl_bps / 10000 * size_usd
-                pnl += trade_pnl
-                if trade_pnl > 0:
-                    wins += 1
-                trades += 1
-                direction = 0
-                cooldown = cooldown_ticks
-                peak_pnl = max(peak_pnl, pnl)
-                max_dd = max(max_dd, peak_pnl - pnl)
-        else:
-            if cooldown > 0:
-                cooldown -= 1
-                continue
-            if abs(trend) >= entry_bps:
-                direction = -1 if trend > 0 else 1
-                entry_price = mid
-
-    duration_min = (prices[-1][0] - prices[0][0]) / 60000 if len(prices) >= 2 else 1
-    freq = trades / (duration_min / 10) if duration_min > 0 else 0
-    win_rate = wins / trades * 100 if trades > 0 else 0
-    return {
-        "trades": trades,
-        "wins": wins,
-        "win_rate": round(win_rate, 1),
-        "pnl": round(pnl, 2),
-        "max_dd": round(max_dd, 2),
-        "trades_per_10min": round(freq, 2),
-        "duration_days": round(duration_min / 60 / 24, 1),
-    }
 
 def load_config(path):
     with open(path) as f:
         return yaml.safe_load(f)
 
+
 def update_yaml_params(config_path, params, old_result, new_result):
     """Update YAML config with new params, keeping a .prev backup for rollback."""
     prev_path = config_path + ".prev"
-    # Backup current config (overwrite any existing .prev)
     shutil.copy2(config_path, prev_path)
     print(f"[BACKTEST] Backup saved: {prev_path}")
 
     with open(config_path) as f:
         content = f.read()
 
-    # Map param keys to YAML keys
     replacements = {
         "tf_entry_threshold_bps": float(params["entry"]),
         "stop_loss_bps": float(params["stop"]),
@@ -142,7 +57,6 @@ def update_yaml_params(config_path, params, old_result, new_result):
         "mr_revert_bps": float(params["revert"]),
     }
     for key, val in replacements.items():
-        # Replace value while preserving comments
         content = re.sub(
             rf'^({key}:\s*)[\d.]+',
             rf'\g<1>{val}',
@@ -150,7 +64,6 @@ def update_yaml_params(config_path, params, old_result, new_result):
             flags=re.MULTILINE,
         )
 
-    # Update the backtest comment line
     content = re.sub(
         r'^# Backtest:.*$',
         f'# Backtest: PnL=${new_result["pnl"]}/7d, '
@@ -169,7 +82,10 @@ def update_yaml_params(config_path, params, old_result, new_result):
     print(f"[BACKTEST] Updated {config_path}: entry={params['entry']} stop={params['stop']} "
           f"tp={params['tp']} revert={params['revert']}")
 
+
 def main():
+    import json
+
     data_file = sys.argv[1] if len(sys.argv) > 1 else DATA_FILE
     config_file = sys.argv[2] if len(sys.argv) > 2 else CONFIG_FILE
 
@@ -179,34 +95,52 @@ def main():
     stop_bps = cfg.get("stop_loss_bps", 30.0)
     tp_bps = cfg.get("tf_take_profit_bps", 5.0)
     revert_bps = cfg.get("mr_revert_bps", 5.0)
+    max_spread = cfg.get("max_spread_bps", 50.0)
+    equity = cfg.get("equity_usd_fallback", 500.0)
+    order_size_pct = cfg.get("order_size_pct", 0.10)
 
-    print(f"[BACKTEST] Loading data: {data_file} (last {LOOKBACK_DAYS} days)")
-    prices = load_prices(data_file, LOOKBACK_DAYS)
-    print(f"[BACKTEST] Loaded {len(prices)} ticks")
+    print(f"[BACKTEST] Loading data: {data_file} (last {LOOKBACK_DAYS} days, max_spread={max_spread}bps)")
+    prices, stats = load_ticks(data_file, max_spread_bps=max_spread, lookback_days=LOOKBACK_DAYS)
+    print(f"[BACKTEST] Loaded {stats['kept']}/{stats['total']} ticks "
+          f"(skipped: {stats['skipped_wide']} wide spread, {stats['skipped_missing']} missing bid/ask)")
 
     if len(prices) < 100:
         print("[BACKTEST] Not enough data, skipping")
         return
 
+    trend_bps_arr, _ = precompute_emas(prices)
+
     # Run with current config
-    result = run_backtest(prices, entry_bps, stop_bps, tp_bps, revert_bps)
+    trades, wins, pnl, max_dd, _ = backtest_mr(
+        prices, trend_bps_arr, entry_bps, stop_bps, tp_bps, revert_bps,
+        equity=equity, order_size_pct=order_size_pct,
+    )
+    result = result_dict(prices, trades, wins, pnl, max_dd)
     print(f"[BACKTEST] Current config: PnL=${result['pnl']} winR={result['win_rate']}% "
           f"trades={result['trades']} maxDD=${result['max_dd']} freq={result['trades_per_10min']}/10m")
 
-    # Also try a grid to find best
+    # Grid search for best params
     best_pnl = result["pnl"]
     best_params = {"entry": entry_bps, "stop": stop_bps, "tp": tp_bps, "revert": revert_bps}
-    for e in [10, 15, 20]:
-        for s in [20, 30, 50]:
-            for t in [3, 5, 8, 10]:
-                for r in [3, 5]:
-                    res = run_backtest(prices, e, s, t, r)
+    for e in [5, 10, 15, 20, 30]:
+        for s in [10, 20, 30, 50]:
+            for t in [3, 5, 8, 10, 15, 20]:
+                for r in [3, 5, 10]:
+                    tr, wi, pn, md, _ = backtest_mr(
+                        prices, trend_bps_arr, e, s, t, r,
+                        equity=equity, order_size_pct=order_size_pct,
+                    )
+                    res = result_dict(prices, tr, wi, pn, md)
                     if res["trades_per_10min"] >= 0.5 and res["pnl"] > best_pnl:
                         best_pnl = res["pnl"]
                         best_params = {"entry": e, "stop": s, "tp": t, "revert": r}
 
-    best_result = run_backtest(prices, best_params["entry"], best_params["stop"],
-                                best_params["tp"], best_params["revert"])
+    best_trades, best_wins, best_pnl_val, best_max_dd, _ = backtest_mr(
+        prices, trend_bps_arr,
+        best_params["entry"], best_params["stop"], best_params["tp"], best_params["revert"],
+        equity=equity, order_size_pct=order_size_pct,
+    )
+    best_result = result_dict(prices, best_trades, best_wins, best_pnl_val, best_max_dd)
 
     # Determine alert level
     if result["pnl"] < 0:
@@ -221,7 +155,8 @@ def main():
 
     params_changed = best_params != {"entry": entry_bps, "stop": stop_bps, "tp": tp_bps, "revert": revert_bps}
     if params_changed:
-        alert_msg += f" | Better params: entry={best_params['entry']} stop={best_params['stop']} tp={best_params['tp']} revert={best_params['revert']} (PnL=${best_pnl})"
+        alert_msg += (f" | Better params: entry={best_params['entry']} stop={best_params['stop']} "
+                      f"tp={best_params['tp']} revert={best_params['revert']} (PnL=${best_pnl})")
 
     print(f"[BACKTEST] {alert_level}: {alert_msg}")
 
@@ -249,8 +184,9 @@ def main():
         "best_params": best_params,
         "best_result": best_result,
         "config_updated": config_updated,
+        "spread_filter": {"max_spread_bps": max_spread, **stats},
         "data_days": LOOKBACK_DAYS,
-        "data_ticks": len(prices),
+        "data_ticks": stats["kept"],
     }
 
     os.makedirs(os.path.dirname(ALERT_FILE), exist_ok=True)
@@ -259,6 +195,7 @@ def main():
         json.dump(alert, f, indent=2)
     os.rename(tmp, ALERT_FILE)
     print(f"[BACKTEST] Alert written to {ALERT_FILE}")
+
 
 if __name__ == "__main__":
     main()
