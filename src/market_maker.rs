@@ -1360,28 +1360,34 @@ impl MmEngine {
         // 6. If we have a position, manage it (stop-loss / take-profit / trailing stop)
         if let Some(direction) = self.tf_direction.clone() {
             let entry = self.tf_entry_price.unwrap_or(mid);
+            // Use exit-side price (bid for Long, ask for Short) instead of mid
+            // to avoid false triggers from wide spreads on thin order books
+            let exit_price = match direction {
+                OrderSide::Long => best_bid,
+                _ => best_ask,
+            };
             let pnl_bps = match direction {
-                OrderSide::Long => (mid - entry) / entry * 10_000.0,
-                _ => (entry - mid) / entry * 10_000.0,
+                OrderSide::Long => (exit_price - entry) / entry * 10_000.0,
+                _ => (entry - exit_price) / entry * 10_000.0,
             };
 
-            // Update peak price for trailing stop
-            let peak = self.tf_peak_price.unwrap_or(mid);
+            // Update peak price for trailing stop (use exit-side price)
+            let peak = self.tf_peak_price.unwrap_or(exit_price);
             let new_peak = match direction {
-                OrderSide::Long => peak.max(mid),
-                _ => if peak == 0.0 { mid } else { peak.min(mid) },
+                OrderSide::Long => peak.max(exit_price),
+                _ => if peak == 0.0 { exit_price } else { peak.min(exit_price) },
             };
             self.tf_peak_price = Some(new_peak);
 
             // Trailing stop: distance from peak
             let trail_bps = match direction {
-                OrderSide::Long => (new_peak - mid) / new_peak * 10_000.0,
-                _ => (mid - new_peak) / new_peak * 10_000.0,
+                OrderSide::Long => (new_peak - exit_price) / new_peak * 10_000.0,
+                _ => (exit_price - new_peak) / new_peak * 10_000.0,
             };
 
             log::info!(
-                "[TF] Position {:?}: pnl={:+.1}bps trail={:.1}bps peak={:.4} mid={:.4} ema_trend={:+.1}bps",
-                direction, pnl_bps, trail_bps, new_peak, mid, ema_trend_bps
+                "[TF] Position {:?}: pnl={:+.1}bps trail={:.1}bps peak={:.4} exit_price={:.4} ema_trend={:+.1}bps",
+                direction, pnl_bps, trail_bps, new_peak, exit_price, ema_trend_bps
             );
 
             // Stop-loss
@@ -1503,6 +1509,9 @@ impl MmEngine {
         let entry = self.tf_entry_price.unwrap_or(0.0);
         let mid = self.last_mid.unwrap_or(0.0);
 
+        // Snapshot equity before close to compute actual realized PnL
+        let equity_before = self.equity_cache;
+
         // Close via close_all_positions for reliability
         log::info!("[TF] Closing position ({}): {:?} entry={:.4} mid={:.4}", reason, direction, entry, mid);
         if let Err(e) = self
@@ -1524,21 +1533,20 @@ impl MmEngine {
             }
         }
 
-        // Compute realized PnL
-        let pnl = match direction {
-            OrderSide::Long => (mid - entry) * self.inventory.abs(),
-            _ => (entry - mid) * self.inventory.abs(),
-        };
+        // Wait for fill then refresh equity from exchange for accurate PnL
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        self.last_equity_fetch = None; // force refresh
+        self.refresh_equity().await;
+        self.sync_inventory_from_exchange().await;
+
+        // Compute realized PnL from actual equity change (not mid price)
+        let pnl = self.equity_cache - equity_before;
         self.tf_pnl += pnl;
 
         log::info!(
-            "[TF] Closed ({}): pnl={:+.2} cumulative={:+.2} trades={}",
-            reason, pnl, self.tf_pnl, self.tf_trades
+            "[TF] Closed ({}): pnl={:+.2} cumulative={:+.2} trades={} (equity {:.2} → {:.2})",
+            reason, pnl, self.tf_pnl, self.tf_trades, equity_before, self.equity_cache
         );
-
-        // Wait then sync
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        self.sync_inventory_from_exchange().await;
 
         // Unwind spot hedge
         self.tf_spot_hedge().await;
@@ -1677,14 +1685,20 @@ impl MmEngine {
         // 6. Position management
         if let Some(direction) = self.tf_direction.clone() {
             let entry = self.tf_entry_price.unwrap_or(mid);
+            // Use exit-side price (bid for Long, ask for Short) instead of mid
+            // to avoid false triggers from wide spreads on thin order books
+            let exit_price = match direction {
+                OrderSide::Long => best_bid,
+                _ => best_ask,
+            };
             let pnl_bps = match direction {
-                OrderSide::Long => (mid - entry) / entry * 10_000.0,
-                _ => (entry - mid) / entry * 10_000.0,
+                OrderSide::Long => (exit_price - entry) / entry * 10_000.0,
+                _ => (entry - exit_price) / entry * 10_000.0,
             };
 
             log::info!(
-                "[MR] Position {:?}: pnl={:+.1}bps ema={:+.1}bps mid={:.4}",
-                direction, pnl_bps, ema_trend_bps, mid
+                "[MR] Position {:?}: pnl={:+.1}bps ema={:+.1}bps mid={:.4} exit_price={:.4}",
+                direction, pnl_bps, ema_trend_bps, mid, exit_price
             );
 
             let mut close = false;
