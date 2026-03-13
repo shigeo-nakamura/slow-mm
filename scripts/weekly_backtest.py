@@ -9,6 +9,8 @@ Cron:  0 6 * * 1  python3 /opt/slow-mm/scripts/weekly_backtest.py
 """
 import json
 import os
+import re
+import shutil
 import sys
 import time
 import yaml
@@ -122,6 +124,51 @@ def load_config(path):
     with open(path) as f:
         return yaml.safe_load(f)
 
+def update_yaml_params(config_path, params, old_result, new_result):
+    """Update YAML config with new params, keeping a .prev backup for rollback."""
+    prev_path = config_path + ".prev"
+    # Backup current config (overwrite any existing .prev)
+    shutil.copy2(config_path, prev_path)
+    print(f"[BACKTEST] Backup saved: {prev_path}")
+
+    with open(config_path) as f:
+        content = f.read()
+
+    # Map param keys to YAML keys
+    replacements = {
+        "tf_entry_threshold_bps": float(params["entry"]),
+        "stop_loss_bps": float(params["stop"]),
+        "tf_take_profit_bps": float(params["tp"]),
+        "mr_revert_bps": float(params["revert"]),
+    }
+    for key, val in replacements.items():
+        # Replace value while preserving comments
+        content = re.sub(
+            rf'^({key}:\s*)[\d.]+',
+            rf'\g<1>{val}',
+            content,
+            flags=re.MULTILINE,
+        )
+
+    # Update the backtest comment line
+    content = re.sub(
+        r'^# Backtest:.*$',
+        f'# Backtest: PnL=${new_result["pnl"]}/7d, '
+        f'{new_result["win_rate"]}% win, '
+        f'maxDD ${new_result["max_dd"]}, '
+        f'{new_result["trades_per_10min"]} trades/10min '
+        f'(auto-updated {datetime.utcnow().strftime("%Y-%m-%d")})',
+        content,
+        flags=re.MULTILINE,
+    )
+
+    tmp_path = config_path + ".tmp"
+    with open(tmp_path, "w") as f:
+        f.write(content)
+    os.rename(tmp_path, config_path)
+    print(f"[BACKTEST] Updated {config_path}: entry={params['entry']} stop={params['stop']} "
+          f"tp={params['tp']} revert={params['revert']}")
+
 def main():
     data_file = sys.argv[1] if len(sys.argv) > 1 else DATA_FILE
     config_file = sys.argv[2] if len(sys.argv) > 2 else CONFIG_FILE
@@ -172,10 +219,24 @@ def main():
         alert_level = "OK"
         alert_msg = f"MR edge OK: PnL=${result['pnl']}/7d winR={result['win_rate']}%"
 
-    if best_params != {"entry": entry_bps, "stop": stop_bps, "tp": tp_bps, "revert": revert_bps}:
+    params_changed = best_params != {"entry": entry_bps, "stop": stop_bps, "tp": tp_bps, "revert": revert_bps}
+    if params_changed:
         alert_msg += f" | Better params: entry={best_params['entry']} stop={best_params['stop']} tp={best_params['tp']} revert={best_params['revert']} (PnL=${best_pnl})"
 
     print(f"[BACKTEST] {alert_level}: {alert_msg}")
+
+    # Auto-update YAML config if better params found
+    config_updated = False
+    old_params = {"entry": entry_bps, "stop": stop_bps, "tp": tp_bps, "revert": revert_bps}
+    if params_changed and best_pnl > 0:
+        try:
+            update_yaml_params(config_file, best_params, result, best_result)
+            config_updated = True
+            alert_msg += " | CONFIG AUTO-UPDATED (restart to apply)"
+            print(f"[BACKTEST] Config auto-updated: {config_file}")
+        except Exception as e:
+            alert_msg += f" | Config update FAILED: {e}"
+            print(f"[BACKTEST] Config update failed: {e}")
 
     # Write alert file for dashboard
     alert = {
@@ -183,15 +244,11 @@ def main():
         "updated_at": datetime.utcnow().isoformat() + "Z",
         "alert_level": alert_level,
         "alert_msg": alert_msg,
-        "current_config": {
-            "entry_bps": entry_bps,
-            "stop_bps": stop_bps,
-            "tp_bps": tp_bps,
-            "revert_bps": revert_bps,
-        },
+        "current_config": old_params,
         "current_result": result,
         "best_params": best_params,
         "best_result": best_result,
+        "config_updated": config_updated,
         "data_days": LOOKBACK_DAYS,
         "data_ticks": len(prices),
     }
