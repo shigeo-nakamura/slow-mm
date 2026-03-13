@@ -61,6 +61,7 @@ const DEFAULT_TF_ENTRY_THRESHOLD_BPS: f64 = 20.0;
 const DEFAULT_TF_TAKE_PROFIT_BPS: f64 = 50.0;
 const DEFAULT_TF_TRAIL_STOP_BPS: f64 = 20.0;
 const DEFAULT_MR_REVERT_BPS: f64 = 5.0;
+const DEFAULT_MR_TREND_PAUSE_BPS: f64 = 0.0; // 0 = disabled
 
 // ---------------------------------------------------------------------------
 // YAML config
@@ -117,6 +118,7 @@ struct MmYaml {
     tf_take_profit_bps: Option<f64>,
     tf_trail_stop_bps: Option<f64>,
     mr_revert_bps: Option<f64>,
+    mr_trend_pause_bps: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +216,8 @@ pub struct MmConfig {
     pub tf_trail_stop_bps: f64,
     /// Close when EMA divergence reverts within this bps (mean_reversion mode)
     pub mr_revert_bps: f64,
+    /// Pause MR entries when EMA10/EMA50 macro trend exceeds this bps (0 = disabled)
+    pub mr_trend_pause_bps: f64,
 }
 
 impl MmConfig {
@@ -323,6 +327,7 @@ impl MmConfig {
             tf_take_profit_bps: yaml.tf_take_profit_bps.unwrap_or(DEFAULT_TF_TAKE_PROFIT_BPS),
             tf_trail_stop_bps: yaml.tf_trail_stop_bps.unwrap_or(DEFAULT_TF_TRAIL_STOP_BPS),
             mr_revert_bps: yaml.mr_revert_bps.unwrap_or(DEFAULT_MR_REVERT_BPS),
+            mr_trend_pause_bps: yaml.mr_trend_pause_bps.unwrap_or(DEFAULT_MR_TREND_PAUSE_BPS),
         };
         cfg.apply_env_overrides();
         Ok(cfg)
@@ -427,6 +432,7 @@ impl MmConfig {
             tf_take_profit_bps: parse_env("TF_TAKE_PROFIT_BPS", DEFAULT_TF_TAKE_PROFIT_BPS),
             tf_trail_stop_bps: parse_env("TF_TRAIL_STOP_BPS", DEFAULT_TF_TRAIL_STOP_BPS),
             mr_revert_bps: parse_env("MR_REVERT_BPS", DEFAULT_MR_REVERT_BPS),
+            mr_trend_pause_bps: parse_env("MR_TREND_PAUSE_BPS", DEFAULT_MR_TREND_PAUSE_BPS),
         };
         cfg.apply_env_overrides();
         Ok(cfg)
@@ -555,6 +561,10 @@ pub struct MmEngine {
     tf_trades: u64,
     /// Trend-follow: cumulative realized PnL
     tf_pnl: f64,
+    /// Macro EMA short (EMA10) for trend pause
+    macro_ema_short: Option<f64>,
+    /// Macro EMA long (EMA50) for trend pause
+    macro_ema_long: Option<f64>,
 }
 
 impl MmEngine {
@@ -653,6 +663,8 @@ impl MmEngine {
             tf_last_stop_time: None,
             tf_trades: 0,
             tf_pnl: 0.0,
+            macro_ema_short: None,
+            macro_ema_long: None,
         })
     }
 
@@ -1649,6 +1661,7 @@ impl MmEngine {
 
         // 2. Update EMA
         self.update_ema(mid);
+        self.update_macro_ema(mid);
         self.last_mid = Some(mid);
 
         // 3. Refresh equity periodically
@@ -1659,6 +1672,7 @@ impl MmEngine {
 
         // 5. EMA divergence
         let ema_trend_bps = self.compute_ema_trend_bps();
+        let macro_trend_bps = self.compute_macro_trend_bps();
 
         // 6. Position management
         if let Some(direction) = self.tf_direction.clone() {
@@ -1707,7 +1721,13 @@ impl MmEngine {
                 }
             }
 
-            // 8. Entry: FADE the trend (mean reversion)
+            // 8. Trend pause: skip if macro trend is too strong
+            if self.cfg.mr_trend_pause_bps > 0.0 && macro_trend_bps.abs() > self.cfg.mr_trend_pause_bps {
+                log::debug!("[MR] Trend pause: macro={:+.1}bps > {}bps", macro_trend_bps, self.cfg.mr_trend_pause_bps);
+                return Ok(());
+            }
+
+            // 9. Entry: FADE the trend (mean reversion)
             if ema_trend_bps.abs() >= self.cfg.tf_entry_threshold_bps {
                 // Uptrend → SHORT (expect reversion down)
                 // Downtrend → LONG (expect reversion up)
@@ -2679,6 +2699,28 @@ impl MmEngine {
             (Some(short), Some(long)) if long > 0.0 => {
                 (short - long) / long * 10_000.0
             }
+            _ => 0.0,
+        }
+    }
+
+    /// Update macro EMA (EMA10/EMA50) for trend pause detection.
+    fn update_macro_ema(&mut self, mid: f64) {
+        let alpha_s = 2.0 / (10.0 + 1.0);
+        let alpha_l = 2.0 / (50.0 + 1.0);
+        self.macro_ema_short = Some(match self.macro_ema_short {
+            Some(prev) => alpha_s * mid + (1.0 - alpha_s) * prev,
+            None => mid,
+        });
+        self.macro_ema_long = Some(match self.macro_ema_long {
+            Some(prev) => alpha_l * mid + (1.0 - alpha_l) * prev,
+            None => mid,
+        });
+    }
+
+    /// Compute macro trend strength in bps (EMA10 vs EMA50).
+    fn compute_macro_trend_bps(&self) -> f64 {
+        match (self.macro_ema_short, self.macro_ema_long) {
+            (Some(s), Some(l)) if l > 0.0 => (s - l) / l * 10_000.0,
             _ => 0.0,
         }
     }
