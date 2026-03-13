@@ -55,6 +55,11 @@ const DEFAULT_CAPTURE_SCAN_INTERVAL_SECS: u64 = 10;
 const DEFAULT_CAPTURE_POLL_INTERVAL_SECS: u64 = 2;
 const DEFAULT_PRICE_DECIMALS: u32 = 1;
 const DEFAULT_SIZE_DECIMALS: u32 = 5;
+const DEFAULT_STOP_LOSS_BPS: f64 = 30.0;
+const DEFAULT_TF_COOLDOWN_SECS: u64 = 60;
+const DEFAULT_TF_ENTRY_THRESHOLD_BPS: f64 = 20.0;
+const DEFAULT_TF_TAKE_PROFIT_BPS: f64 = 50.0;
+const DEFAULT_TF_TRAIL_STOP_BPS: f64 = 20.0;
 
 // ---------------------------------------------------------------------------
 // YAML config
@@ -105,6 +110,11 @@ struct MmYaml {
     price_decimals: Option<u32>,
     size_decimals: Option<u32>,
     spot_hedge_symbol: Option<String>,
+    stop_loss_bps: Option<f64>,
+    tf_cooldown_secs: Option<u64>,
+    tf_entry_threshold_bps: Option<f64>,
+    tf_take_profit_bps: Option<f64>,
+    tf_trail_stop_bps: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +200,16 @@ pub struct MmConfig {
     pub size_decimals: u32,
     /// Spot symbol for delta-neutral hedging (e.g. "LIT/USDC"). Empty = disabled.
     pub spot_hedge_symbol: String,
+    /// Stop-loss in bps from entry price (trend_follow mode)
+    pub stop_loss_bps: f64,
+    /// Cooldown seconds after stop-loss before next entry (trend_follow mode)
+    pub tf_cooldown_secs: u64,
+    /// EMA trend strength threshold in bps to trigger entry (trend_follow mode)
+    pub tf_entry_threshold_bps: f64,
+    /// Take-profit in bps from entry price (trend_follow mode)
+    pub tf_take_profit_bps: f64,
+    /// Trailing stop in bps below peak (trend_follow mode)
+    pub tf_trail_stop_bps: f64,
 }
 
 impl MmConfig {
@@ -293,6 +313,11 @@ impl MmConfig {
             price_decimals: yaml.price_decimals.unwrap_or(DEFAULT_PRICE_DECIMALS),
             size_decimals: yaml.size_decimals.unwrap_or(DEFAULT_SIZE_DECIMALS),
             spot_hedge_symbol: yaml.spot_hedge_symbol.unwrap_or_default(),
+            stop_loss_bps: yaml.stop_loss_bps.unwrap_or(DEFAULT_STOP_LOSS_BPS),
+            tf_cooldown_secs: yaml.tf_cooldown_secs.unwrap_or(DEFAULT_TF_COOLDOWN_SECS),
+            tf_entry_threshold_bps: yaml.tf_entry_threshold_bps.unwrap_or(DEFAULT_TF_ENTRY_THRESHOLD_BPS),
+            tf_take_profit_bps: yaml.tf_take_profit_bps.unwrap_or(DEFAULT_TF_TAKE_PROFIT_BPS),
+            tf_trail_stop_bps: yaml.tf_trail_stop_bps.unwrap_or(DEFAULT_TF_TRAIL_STOP_BPS),
         };
         cfg.apply_env_overrides();
         Ok(cfg)
@@ -391,6 +416,11 @@ impl MmConfig {
             price_decimals: parse_env("PRICE_DECIMALS", DEFAULT_PRICE_DECIMALS),
             size_decimals: parse_env("SIZE_DECIMALS", DEFAULT_SIZE_DECIMALS),
             spot_hedge_symbol: env::var("SPOT_HEDGE_SYMBOL").unwrap_or_default(),
+            stop_loss_bps: parse_env("STOP_LOSS_BPS", DEFAULT_STOP_LOSS_BPS),
+            tf_cooldown_secs: parse_env("TF_COOLDOWN_SECS", DEFAULT_TF_COOLDOWN_SECS),
+            tf_entry_threshold_bps: parse_env("TF_ENTRY_THRESHOLD_BPS", DEFAULT_TF_ENTRY_THRESHOLD_BPS),
+            tf_take_profit_bps: parse_env("TF_TAKE_PROFIT_BPS", DEFAULT_TF_TAKE_PROFIT_BPS),
+            tf_trail_stop_bps: parse_env("TF_TRAIL_STOP_BPS", DEFAULT_TF_TRAIL_STOP_BPS),
         };
         cfg.apply_env_overrides();
         Ok(cfg)
@@ -507,6 +537,18 @@ pub struct MmEngine {
     status_reporter: Option<StatusReporter>,
     /// State for reactive spread capture strategy
     capture_state: CaptureState,
+    /// Trend-follow: direction of current position (None = flat)
+    tf_direction: Option<OrderSide>,
+    /// Trend-follow: entry price of current trend position
+    tf_entry_price: Option<f64>,
+    /// Trend-follow: peak price seen since entry (for trailing stop)
+    tf_peak_price: Option<f64>,
+    /// Trend-follow: last stop-loss time (for cooldown)
+    tf_last_stop_time: Option<Instant>,
+    /// Trend-follow: number of trades taken
+    tf_trades: u64,
+    /// Trend-follow: cumulative realized PnL
+    tf_pnl: f64,
 }
 
 impl MmEngine {
@@ -599,6 +641,12 @@ impl MmEngine {
                 captures: 0,
                 capture_pnl: 0.0,
             },
+            tf_direction: None,
+            tf_entry_price: None,
+            tf_peak_price: None,
+            tf_last_stop_time: None,
+            tf_trades: 0,
+            tf_pnl: 0.0,
         })
     }
 
@@ -684,6 +732,7 @@ impl MmEngine {
 
         match self.cfg.strategy_mode.as_str() {
             "reactive_capture" => self.run_reactive().await,
+            "trend_follow" => self.run_trend_follow().await,
             _ => self.run_passive_mm().await,
         }
     }
@@ -1201,6 +1250,342 @@ impl MmEngine {
             }
         }
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Trend Follow strategy
+    // -----------------------------------------------------------------------
+
+    async fn run_trend_follow(&mut self) -> Result<()> {
+        log::info!(
+            "[TF] Starting trend_follow: entry_threshold={}bps stop_loss={}bps take_profit={}bps trail_stop={}bps cooldown={}s",
+            self.cfg.tf_entry_threshold_bps,
+            self.cfg.stop_loss_bps,
+            self.cfg.tf_take_profit_bps,
+            self.cfg.tf_trail_stop_bps,
+            self.cfg.tf_cooldown_secs,
+        );
+
+        let mut ticker = tokio::time::interval(Duration::from_secs(self.cfg.interval_secs));
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+
+        // Initial equity + EMA warm-up
+        self.refresh_equity().await;
+
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if let Err(e) = self.tf_step().await {
+                        log::error!("[TF] step failed: {:?}", e);
+                    }
+                }
+                _ = sigterm.recv() => {
+                    log::info!("[TF] SIGTERM received, shutting down...");
+                    break;
+                }
+            }
+        }
+        // On shutdown: close perp position, cancel orders
+        self.tf_close_position_market("shutdown").await;
+        self.cancel_all_main_orders().await;
+        // Cancel spot hedge orders
+        if !self.cfg.spot_hedge_symbol.is_empty() {
+            let _ = self.main_conn.cancel_all_orders(Some(self.cfg.spot_hedge_symbol.clone())).await;
+        }
+        log::info!(
+            "[TF] Shutdown complete. trades={} pnl={:.2}",
+            self.tf_trades,
+            self.tf_pnl
+        );
+        Ok(())
+    }
+
+    async fn tf_step(&mut self) -> Result<()> {
+        // 0. Maintenance check
+        if self.check_maintenance().await {
+            if self.tf_direction.is_some() {
+                self.tf_close_position_market("maintenance").await;
+            }
+            return Ok(());
+        }
+
+        // 1. Get mid price from order book
+        let ob = self
+            .main_conn
+            .get_order_book(&self.cfg.symbol, self.cfg.ob_depth)
+            .await
+            .context("failed to fetch order book")?;
+
+        let best_bid = ob.bids.first().map(|l| l.price.to_f64().unwrap_or(0.0)).unwrap_or(0.0);
+        let best_ask = ob.asks.first().map(|l| l.price.to_f64().unwrap_or(0.0)).unwrap_or(0.0);
+        if best_bid <= 0.0 || best_ask <= 0.0 {
+            log::warn!("[TF] Invalid OB: bid={} ask={}", best_bid, best_ask);
+            return Ok(());
+        }
+        let mid = (best_bid + best_ask) / 2.0;
+
+        // 2. Update EMA
+        self.update_ema(mid);
+        self.last_mid = Some(mid);
+
+        // 3. Refresh equity periodically
+        self.refresh_equity().await;
+
+        // 4. Sync position from exchange
+        self.sync_inventory_from_exchange().await;
+
+        // 5. Compute EMA trend signal
+        let ema_trend_bps = self.compute_ema_trend_bps();
+
+        // 6. If we have a position, manage it (stop-loss / take-profit / trailing stop)
+        if let Some(direction) = self.tf_direction.clone() {
+            let entry = self.tf_entry_price.unwrap_or(mid);
+            let pnl_bps = match direction {
+                OrderSide::Long => (mid - entry) / entry * 10_000.0,
+                _ => (entry - mid) / entry * 10_000.0,
+            };
+
+            // Update peak price for trailing stop
+            let peak = self.tf_peak_price.unwrap_or(mid);
+            let new_peak = match direction {
+                OrderSide::Long => peak.max(mid),
+                _ => if peak == 0.0 { mid } else { peak.min(mid) },
+            };
+            self.tf_peak_price = Some(new_peak);
+
+            // Trailing stop: distance from peak
+            let trail_bps = match direction {
+                OrderSide::Long => (new_peak - mid) / new_peak * 10_000.0,
+                _ => (mid - new_peak) / new_peak * 10_000.0,
+            };
+
+            log::info!(
+                "[TF] Position {:?}: pnl={:+.1}bps trail={:.1}bps peak={:.4} mid={:.4} ema_trend={:+.1}bps",
+                direction, pnl_bps, trail_bps, new_peak, mid, ema_trend_bps
+            );
+
+            // Stop-loss
+            if pnl_bps <= -(self.cfg.stop_loss_bps) {
+                log::warn!("[TF] STOP-LOSS triggered: pnl={:+.1}bps", pnl_bps);
+                self.tf_close_position_market("stop_loss").await;
+                self.tf_last_stop_time = Some(Instant::now());
+                return Ok(());
+            }
+
+            // Take-profit
+            if pnl_bps >= self.cfg.tf_take_profit_bps {
+                log::info!("[TF] TAKE-PROFIT triggered: pnl={:+.1}bps", pnl_bps);
+                self.tf_close_position_market("take_profit").await;
+                return Ok(());
+            }
+
+            // Trailing stop (only after position is in profit)
+            if pnl_bps > 0.0 && trail_bps >= self.cfg.tf_trail_stop_bps {
+                log::info!("[TF] TRAILING-STOP triggered: trail={:.1}bps pnl={:+.1}bps", trail_bps, pnl_bps);
+                self.tf_close_position_market("trail_stop").await;
+                return Ok(());
+            }
+
+            // Trend reversal exit: if EMA flips against position, exit
+            let trend_reversed = match direction {
+                OrderSide::Long => ema_trend_bps < -(self.cfg.tf_entry_threshold_bps / 2.0),
+                _ => ema_trend_bps > self.cfg.tf_entry_threshold_bps / 2.0,
+            };
+            if trend_reversed {
+                log::info!("[TF] TREND-REVERSAL exit: ema={:+.1}bps direction={:?}", ema_trend_bps, direction);
+                self.tf_close_position_market("trend_reversal").await;
+                return Ok(());
+            }
+
+            // Report status
+            self.tf_report_status(mid, pnl_bps).await;
+        } else {
+            // 7. No position — check for entry signal
+            // Cooldown check
+            if let Some(last_stop) = self.tf_last_stop_time {
+                if last_stop.elapsed() < Duration::from_secs(self.cfg.tf_cooldown_secs) {
+                    let remaining = self.cfg.tf_cooldown_secs - last_stop.elapsed().as_secs();
+                    log::debug!("[TF] Cooldown: {}s remaining", remaining);
+                    return Ok(());
+                }
+            }
+
+            // Entry: EMA trend exceeds threshold
+            if ema_trend_bps.abs() >= self.cfg.tf_entry_threshold_bps {
+                let side = if ema_trend_bps > 0.0 {
+                    OrderSide::Long
+                } else {
+                    OrderSide::Short
+                };
+
+                // Calculate position size: order_size_pct of equity
+                let equity = self.equity_cache;
+                let size_usd = equity * self.cfg.order_size_pct;
+                let size_tokens = size_usd / mid;
+                let size_dec = self.round_size(size_tokens);
+
+                if size_dec <= Decimal::ZERO {
+                    log::warn!("[TF] Computed size is zero, equity={:.2}", equity);
+                    return Ok(());
+                }
+
+                log::info!(
+                    "[TF] ENTRY signal: ema={:+.1}bps → {:?} size={} (${:.2}) mid={:.4}",
+                    ema_trend_bps, side, size_dec, size_usd, mid
+                );
+
+                // Place market order on perp
+                match self.main_conn
+                    .create_order(&self.cfg.symbol, size_dec, side.clone(), None, None, false, None)
+                    .await
+                {
+                    Ok(_) => {
+                        self.tf_direction = Some(side.clone());
+                        self.tf_entry_price = Some(mid);
+                        self.tf_peak_price = Some(mid);
+                        self.tf_trades += 1;
+                        log::info!("[TF] Entry placed: {:?} size={} @ ~{:.4}", side, size_dec, mid);
+
+                        // Wait for fill then sync
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        self.sync_inventory_from_exchange().await;
+
+                        // Update entry price from actual fill if available
+                        if let Some(ep) = self.position_entry_price {
+                            self.tf_entry_price = Some(ep);
+                            log::info!("[TF] Actual entry price: {:.4}", ep);
+                        }
+
+                        // Immediate spot hedge
+                        self.tf_spot_hedge().await;
+                    }
+                    Err(e) => {
+                        log::error!("[TF] Entry order failed: {:?}", e);
+                    }
+                }
+            } else {
+                log::debug!("[TF] Flat, waiting for signal: ema={:+.1}bps (threshold={}bps)", ema_trend_bps, self.cfg.tf_entry_threshold_bps);
+            }
+
+            // Report flat status
+            self.tf_report_status(mid, 0.0).await;
+        }
+
+        Ok(())
+    }
+
+    /// Close the current trend-follow perp position with a market order
+    async fn tf_close_position_market(&mut self, reason: &str) {
+        if self.tf_direction.is_none() {
+            return;
+        }
+        let direction = self.tf_direction.as_ref().unwrap().clone();
+        let entry = self.tf_entry_price.unwrap_or(0.0);
+        let mid = self.last_mid.unwrap_or(0.0);
+
+        // Close via close_all_positions for reliability
+        log::info!("[TF] Closing position ({}): {:?} entry={:.4} mid={:.4}", reason, direction, entry, mid);
+        if let Err(e) = self
+            .main_conn
+            .close_all_positions(Some(self.cfg.symbol.clone()))
+            .await
+        {
+            log::error!("[TF] Failed to close position: {:?}", e);
+            // Fallback: try market order in opposite direction
+            let close_side = match direction {
+                OrderSide::Long => OrderSide::Short,
+                _ => OrderSide::Long,
+            };
+            let size = self.round_size(self.inventory.abs());
+            if size > Decimal::ZERO {
+                let _ = self.main_conn
+                    .create_order(&self.cfg.symbol, size, close_side, None, None, false, None)
+                    .await;
+            }
+        }
+
+        // Compute realized PnL
+        let pnl = match direction {
+            OrderSide::Long => (mid - entry) * self.inventory.abs(),
+            _ => (entry - mid) * self.inventory.abs(),
+        };
+        self.tf_pnl += pnl;
+
+        log::info!(
+            "[TF] Closed ({}): pnl={:+.2} cumulative={:+.2} trades={}",
+            reason, pnl, self.tf_pnl, self.tf_trades
+        );
+
+        // Wait then sync
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        self.sync_inventory_from_exchange().await;
+
+        // Unwind spot hedge
+        self.tf_spot_hedge().await;
+
+        // Reset state
+        self.tf_direction = None;
+        self.tf_entry_price = None;
+        self.tf_peak_price = None;
+    }
+
+    /// Spot hedge: keep delta-neutral by hedging perp inventory on spot market
+    async fn tf_spot_hedge(&mut self) {
+        if self.cfg.spot_hedge_symbol.is_empty() {
+            return;
+        }
+        let mid = self.last_mid.unwrap_or(0.0);
+        if mid <= 0.0 {
+            return;
+        }
+
+        let net_exposure = self.inventory + self.hedge_position;
+        if net_exposure.abs() < 1.0 {
+            return;
+        }
+
+        let hedge_side = if net_exposure > 0.0 {
+            OrderSide::Short // net long → sell spot
+        } else {
+            OrderSide::Long // net short → buy spot
+        };
+        let hedge_size = self.round_size(net_exposure.abs());
+        if hedge_size <= Decimal::ZERO {
+            return;
+        }
+
+        log::info!(
+            "[TF-HEDGE] net_exp={:.2} → {:?} {} size={}",
+            net_exposure, hedge_side, self.cfg.spot_hedge_symbol, hedge_size
+        );
+
+        match self.main_conn
+            .create_order(&self.cfg.spot_hedge_symbol, hedge_size, hedge_side.clone(), None, None, false, None)
+            .await
+        {
+            Ok(_) => {
+                log::info!("[TF-HEDGE] Spot hedge placed: {:?} size={}", hedge_side, hedge_size);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                self.sync_inventory_from_exchange().await;
+            }
+            Err(e) => {
+                log::error!("[TF-HEDGE] Failed: {:?}", e);
+            }
+        }
+    }
+
+    /// Report trend-follow status to dashboard
+    async fn tf_report_status(&mut self, _mid: f64, _pnl_bps: f64) {
+        if self.status_reporter.is_some() {
+            let total_equity = self.equity_cache + self.hedge_equity_cache;
+            let positions = self.build_position_info().await;
+            let reporter = self.status_reporter.as_mut().unwrap();
+            reporter.update_equity(total_equity);
+            if let Err(err) = reporter.write_snapshot_if_due(&positions) {
+                log::warn!("[TF-STATUS] failed to write status: {:?}", err);
+            }
+        }
     }
 
     async fn shutdown(&mut self) {

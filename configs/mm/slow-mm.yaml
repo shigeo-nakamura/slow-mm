@@ -1,6 +1,6 @@
 symbol: LIT
 dry_run: false
-strategy_mode: passive_mm
+strategy_mode: trend_follow
 price_decimals: 4              # LIT: $1.1050 (0.0001 tick)
 size_decimals: 2               # LIT: 209.42 (0.01 step)
 
@@ -8,45 +8,35 @@ size_decimals: 2               # LIT: 209.42 (0.01 step)
 spot_hedge_symbol: "LIT/USDC"
 
 # Timing
-interval_secs: 30             # 30s cycle — LIT spread is wide, no need to requote often
+interval_secs: 30             # 30s EMA update cycle
 
-# Spread / quoting
-spread_bps: 25                # Must exceed spot taker cost (~10bps) per side: 25/2=12.5bps > 10bps
-order_size_pct: 0.02          # 2% of equity per order level
-order_levels: 2               # 2 levels each side for better fill probability
-level_spacing_bps: 10         # 2nd level 10bps deeper
+# Position sizing
+order_size_pct: 0.05          # 5% of equity per trend trade
+
+# EMA trend detection (reused from passive_mm)
+ema_short_periods: 5
+ema_long_periods: 20
+
+# Trend-follow parameters
+tf_entry_threshold_bps: 20.0  # Enter when |EMA_short - EMA_long| > 20bps
+stop_loss_bps: 30.0           # Hard stop-loss at -30bps from entry
+tf_take_profit_bps: 50.0      # Take profit at +50bps from entry
+tf_trail_stop_bps: 20.0       # Trailing stop: 20bps below peak
+tf_cooldown_secs: 60           # 60s cooldown after stop-loss
+
+# Passive MM settings (unused in trend_follow, kept for fallback)
+spread_bps: 25
+order_levels: 1
 ob_depth: 5
-ob_imbalance_factor: 1.0      # shift spread based on bid/ask depth imbalance
-funding_rate_factor: 1.0      # bias skew toward FR-favorable side
-
-# Inventory management
-max_inventory_pct: 0.05       # 5% of equity as max unhedged inventory
-skew_factor: 5.0              # strong skew to discourage adding to position
-inventory_hard_limit_mult: 0.4    # ~1 order fill = hard limit, stop same-side quotes
-force_close_mult: 1.5
-force_close_cooldown_secs: 120
-
-# Volatility-adaptive spread
+max_inventory_pct: 0.05
+skew_factor: 5.0
+inventory_hard_limit_mult: 0.4
 volatility_window: 60
-volatility_spread_mult: 1.0
 min_spread_bps: 5
 max_spread_bps: 50
 
-# Adverse selection protection
-trend_window: 10
-trend_threshold_bps: 15.0
-ema_short_periods: 5
-ema_long_periods: 20
-trend_strength_threshold: 40.0
-aggressive_unwind_bps: 2.0
-post_fill_spread_mult: 1.3
-post_fill_decay_secs: 15
-inventory_spread_mult: 0.5
-
 # Hedge (sub-account) — disabled, using spot hedge instead
 hedge_enabled: false
-hedge_threshold_ratio: 0.2
-hedge_close_threshold_ratio: 0.1
 
 # Risk
 max_leverage: 20
