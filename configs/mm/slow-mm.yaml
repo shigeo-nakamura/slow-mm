@@ -11,7 +11,7 @@ spot_hedge_symbol: ""
 interval_secs: 20             # 20s EMA update cycle
 
 # Position sizing
-order_size_pct: 0.05          # 5% of equity per trade
+order_size_pct: 0.10          # 10% of equity per trade
 
 # EMA parameters
 ema_short_periods: 5
