@@ -1,6 +1,6 @@
 symbol: LIT
 dry_run: false
-strategy_mode: trend_follow
+strategy_mode: mean_reversion
 price_decimals: 4              # LIT: $1.1050 (0.0001 tick)
 size_decimals: 2               # LIT: 209.42 (0.01 step)
 
@@ -8,23 +8,24 @@ size_decimals: 2               # LIT: 209.42 (0.01 step)
 spot_hedge_symbol: "LIT/USDC"
 
 # Timing
-interval_secs: 30             # 30s EMA update cycle
+interval_secs: 20             # 20s EMA update cycle (match data interval)
 
 # Position sizing
-order_size_pct: 0.05          # 5% of equity per trend trade
+order_size_pct: 0.05          # 5% of equity per trade
 
-# EMA trend detection (reused from passive_mm)
+# EMA parameters
 ema_short_periods: 5
 ema_long_periods: 20
 
-# Trend-follow parameters
-tf_entry_threshold_bps: 8.0   # Enter when |EMA_short - EMA_long| > 8bps (LIT moves slowly)
-stop_loss_bps: 30.0           # Hard stop-loss at -30bps from entry
-tf_take_profit_bps: 50.0      # Take profit at +50bps from entry
-tf_trail_stop_bps: 15.0       # Trailing stop: 15bps below peak
-tf_cooldown_secs: 60           # 60s cooldown after stop-loss
+# Mean-reversion parameters (optimized via 30-day backtest)
+# Backtest result: +$165/30d, 79% win rate, maxDD $2.71, 1.41 trades/10min
+tf_entry_threshold_bps: 15.0  # Enter (fade) when EMA divergence > 15bps
+stop_loss_bps: 30.0           # Hard stop-loss at -30bps
+tf_take_profit_bps: 5.0       # Take profit at +5bps (quick scalp)
+mr_revert_bps: 5.0            # Close when EMA converges within 5bps
+tf_cooldown_secs: 60          # 60s cooldown after close
 
-# Passive MM settings (unused in trend_follow, kept for fallback)
+# Passive MM settings (unused, kept for fallback)
 spread_bps: 25
 order_levels: 1
 ob_depth: 5
@@ -35,7 +36,7 @@ volatility_window: 60
 min_spread_bps: 5
 max_spread_bps: 50
 
-# Hedge (sub-account) — disabled, using spot hedge instead
+# Hedge (sub-account) — disabled
 hedge_enabled: false
 
 # Risk
