@@ -62,24 +62,20 @@ def load_ticks(path, max_spread_bps=50.0, lookback_days=None):
             if bid_str and ask_str:
                 bid = float(bid_str)
                 ask = float(ask_str)
+                # Sanity check: bid/ask must be within 10% of mid price
+                # (guards against cross-symbol data contamination)
                 if bid > 0 and ask > 0 and bid < ask:
-                    spread_bps = (ask - bid) / ((ask + bid) / 2) * 10000.0
-                    if spread_bps > max_spread_bps:
-                        skipped_wide += 1
-                        continue
-                    # Use actual mid from bid/ask for consistency
-                    mid = (bid + ask) / 2.0
+                    if abs(bid - mid) / mid > 0.10 or abs(ask - mid) / mid > 0.10:
+                        skipped_missing += 1
+                        # Fall through to use mid only (bid/ask is from wrong symbol)
+                    else:
+                        spread_bps = (ask - bid) / ((ask + bid) / 2) * 10000.0
+                        if spread_bps > max_spread_bps:
+                            skipped_wide += 1
+                            continue
+                        mid = (bid + ask) / 2.0
                 else:
-                    # Invalid bid/ask (e.g., bid=0 or ask=0)
                     skipped_missing += 1
-                    continue
-            elif bid_str or ask_str:
-                # Only one side available — skip (can't compute spread)
-                skipped_missing += 1
-                continue
-            else:
-                # No bid/ask at all — use mid price as-is (legacy data)
-                pass
 
             ticks.append((ts, mid))
 

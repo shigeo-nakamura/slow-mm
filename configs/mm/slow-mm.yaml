@@ -17,12 +17,12 @@ order_size_pct: 0.10          # 10% of equity per trade
 ema_short_periods: 5
 ema_long_periods: 20
 
-# Mean-reversion parameters (optimized via 30-day backtest with 16bps spread)
-# Backtest: +$565/30d, 43% win rate, maxDD $37.80, 0.51 trades/10min
-tf_entry_threshold_bps: 30.0  # Enter (fade) when EMA divergence > 30bps
-stop_loss_bps: 20.0           # Tight stop-loss at -20bps
+# Mean-reversion parameters (optimized via 30-day backtest with 8bps residual spread)
+# Backtest: PnL=$768/30d, 43% win, maxDD ~$38, 0.51 trades/10min (auto-updated 2026-03-13)
+tf_entry_threshold_bps: 20.0  # Enter (fade) when EMA divergence > 20bps
+stop_loss_bps: 80.0           # Wide stop-loss at -80bps (avoid noise stops)
 tf_take_profit_bps: 15.0      # Take profit at +15bps (> spread cost)
-mr_revert_bps: 10.0           # Close when EMA converges within 10bps
+mr_revert_bps: 3.0            # Close when EMA converges within 3bps
 tf_cooldown_secs: 60          # 60s cooldown after close
 
 # Trend pause: 0 = disabled. Set to e.g. 80 to pause during strong trends.
