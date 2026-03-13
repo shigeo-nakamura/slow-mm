@@ -18,10 +18,10 @@ ema_short_periods: 5
 ema_long_periods: 20
 
 # Trend-follow parameters
-tf_entry_threshold_bps: 20.0  # Enter when |EMA_short - EMA_long| > 20bps
+tf_entry_threshold_bps: 8.0   # Enter when |EMA_short - EMA_long| > 8bps (LIT moves slowly)
 stop_loss_bps: 30.0           # Hard stop-loss at -30bps from entry
 tf_take_profit_bps: 50.0      # Take profit at +50bps from entry
-tf_trail_stop_bps: 20.0       # Trailing stop: 20bps below peak
+tf_trail_stop_bps: 15.0       # Trailing stop: 15bps below peak
 tf_cooldown_secs: 60           # 60s cooldown after stop-loss
 
 # Passive MM settings (unused in trend_follow, kept for fallback)
