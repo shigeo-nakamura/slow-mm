@@ -582,7 +582,8 @@ impl MmEngine {
         }
 
         // Create main connector (handles both perp and spot via single nonce sequence)
-        let main_conn = DexConnectorBox::create_lighter("", cfg.dry_run, &tokens)
+        let ob_stale_secs = Some(cfg.interval_secs * 3);
+        let main_conn = DexConnectorBox::create_lighter("", cfg.dry_run, &tokens, ob_stale_secs)
             .await
             .context("failed to create main connector")?;
         main_conn
@@ -604,7 +605,7 @@ impl MmEngine {
 
         // Create hedge connector only for legacy sub-account hedge (NOT spot hedge)
         let hedge_conn = if cfg.hedge_enabled && !use_spot_hedge {
-            match DexConnectorBox::create_lighter("HEDGE_", cfg.dry_run, &tokens).await {
+            match DexConnectorBox::create_lighter("HEDGE_", cfg.dry_run, &tokens, ob_stale_secs).await {
                 Ok(hc) => {
                     if let Err(e) = hc.start().await {
                         log::error!("[INIT] Failed to start hedge connector: {:?}", e);
