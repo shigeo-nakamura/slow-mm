@@ -1707,23 +1707,22 @@ impl MmEngine {
         // (don't skip the whole tick — we need to protect the position)
         if wide_spread {
             if self.tf_direction.is_some() {
-                log::warn!(
-                    "[MR] Wide spread {:.1}bps but have position, checking stop-loss only (bid={:.4} ask={:.4})",
-                    spread_bps, best_bid, best_ask
-                );
-                // Use best_bid as conservative exit price for stop-loss check
+                // During wide spread, use mid for stop-loss check instead of best_ask/best_bid.
+                // On thin order books, the far side of the spread can spike to absurd levels
+                // (e.g. ask=1.1080 when mid=1.0823) causing false stop-loss triggers.
+                // Mid is more stable and closer to the actual executable price.
                 let direction = self.tf_direction.as_ref().unwrap().clone();
-                let entry = self.tf_entry_price.unwrap_or(best_bid);
-                let exit_price = match direction {
-                    OrderSide::Long => best_bid,
-                    _ => best_ask,
-                };
+                let entry = self.tf_entry_price.unwrap_or(mid);
                 let pnl_bps = match direction {
-                    OrderSide::Long => (exit_price - entry) / entry * 10_000.0,
-                    _ => (entry - exit_price) / entry * 10_000.0,
+                    OrderSide::Long => (mid - entry) / entry * 10_000.0,
+                    _ => (entry - mid) / entry * 10_000.0,
                 };
+                log::warn!(
+                    "[MR] Wide spread {:.1}bps but have position, checking stop-loss with mid={:.4} (bid={:.4} ask={:.4}) pnl={:+.1}bps",
+                    spread_bps, mid, best_bid, best_ask, pnl_bps
+                );
                 if pnl_bps <= -(self.cfg.stop_loss_bps) {
-                    log::warn!("[MR] STOP-LOSS during wide spread: pnl={:+.1}bps", pnl_bps);
+                    log::warn!("[MR] STOP-LOSS during wide spread: pnl={:+.1}bps (mid-based)", pnl_bps);
                     self.tf_close_position_market("stop_loss").await;
                     self.tf_last_stop_time = Some(Instant::now());
                 }
