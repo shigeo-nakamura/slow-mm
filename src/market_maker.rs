@@ -1355,6 +1355,14 @@ impl MmEngine {
 
         if wide_spread {
             if self.tf_direction.is_some() {
+                let extreme_spread = spread_bps > self.cfg.max_spread_bps * 4.0;
+                if extreme_spread {
+                    log::warn!(
+                        "[TF] Extreme spread {:.1}bps (>{:.0}bps), skipping SL check — mid unreliable (bid={:.4} ask={:.4})",
+                        spread_bps, self.cfg.max_spread_bps * 4.0, best_bid, best_ask
+                    );
+                    return Ok(());
+                }
                 log::warn!(
                     "[TF] Wide spread {:.1}bps but have position, checking stop-loss only",
                     spread_bps
@@ -1709,14 +1717,20 @@ impl MmEngine {
 
         let wide_spread = spread_bps > self.cfg.max_spread_bps;
 
-        // If spread is wide but we have a position, still check stop-loss using best_bid
-        // (don't skip the whole tick — we need to protect the position)
+        // If spread is wide but we have a position, still check stop-loss using mid.
+        // However, if spread is extremely wide (>4× max_spread), mid itself is unreliable
+        // (e.g. one side of the book is nearly empty), so skip SL check entirely and wait
+        // for the order book to normalize.
         if wide_spread {
             if self.tf_direction.is_some() {
-                // During wide spread, use mid for stop-loss check instead of best_ask/best_bid.
-                // On thin order books, the far side of the spread can spike to absurd levels
-                // (e.g. ask=1.1080 when mid=1.0823) causing false stop-loss triggers.
-                // Mid is more stable and closer to the actual executable price.
+                let extreme_spread = spread_bps > self.cfg.max_spread_bps * 4.0;
+                if extreme_spread {
+                    log::warn!(
+                        "[MR] Extreme spread {:.1}bps (>{:.0}bps), skipping SL check — mid unreliable (bid={:.4} ask={:.4})",
+                        spread_bps, self.cfg.max_spread_bps * 4.0, best_bid, best_ask
+                    );
+                    return Ok(());
+                }
                 let direction = self.tf_direction.as_ref().unwrap().clone();
                 let entry = self.tf_entry_price.unwrap_or(mid);
                 let pnl_bps = match direction {
@@ -1785,12 +1799,12 @@ impl MmEngine {
             let mut reason = "";
 
             // Regime-aware take-profit: scale TP with macro trend strength
-            let regime_threshold = 5.0_f64;
+            let regime_mid_threshold = 5.0_f64;
             let macro_abs = macro_trend_bps.abs();
-            let regime_scale = if macro_abs < regime_threshold {
+            let regime_scale = if self.regime == "range" {
                 1.0
             } else {
-                (macro_abs / regime_threshold).min(3.0)
+                (macro_abs / regime_mid_threshold).max(1.0).min(3.0)
             };
             let effective_tp_bps = self.cfg.tf_take_profit_bps * regime_scale;
 
@@ -1845,13 +1859,17 @@ impl MmEngine {
                 }
             }
 
-            // 8. Regime detection: adapt MR parameters to market environment
+            // 8. Regime detection with hysteresis to prevent chattering.
+            //    Uses asymmetric thresholds: higher to enter trend, lower to exit back to range.
             //    macro_trend_bps = EMA10 vs EMA50 divergence (slow indicator)
-            //    Range: small divergence → tight params (low entry, low tp)
-            //    Trend: large divergence → conservative params (high entry, high tp)
-            let regime_threshold = 5.0; // bps: below = range, above = trend
+            let regime_enter_threshold = 8.0; // bps: range → trend requires > 8bps
+            let regime_exit_threshold = 3.0;  // bps: trend → range requires < 3bps
+            let regime_mid_threshold = 5.0;   // bps: used for regime scaling baseline
             let macro_abs = macro_trend_bps.abs();
-            let new_regime = if macro_abs < regime_threshold { "range" } else { "trend" };
+            let new_regime = match self.regime {
+                "range" => if macro_abs > regime_enter_threshold { "trend" } else { "range" },
+                _ => if macro_abs < regime_exit_threshold { "range" } else { "trend" },
+            };
             if new_regime != self.regime {
                 log::info!(
                     "[MR] Regime change: {} → {} (macro={:+.1}bps)",
@@ -1863,11 +1881,11 @@ impl MmEngine {
             // Scale entry/tp/stop based on regime
             // Range: use config values as-is (optimized for mean-reversion)
             // Trend: scale up entry threshold (harder to enter) and tp (bigger target)
-            let regime_scale = if macro_abs < regime_threshold {
+            let regime_scale = if self.regime == "range" {
                 1.0
             } else {
-                // Linear scale: 1.0 at threshold, 2.0 at 2×threshold, capped at 3.0
-                (macro_abs / regime_threshold).min(3.0)
+                // Linear scale: 1.0 at mid_threshold, 2.0 at 2×mid_threshold, capped at 3.0
+                (macro_abs / regime_mid_threshold).max(1.0).min(3.0)
             };
             let effective_entry_bps = self.cfg.tf_entry_threshold_bps * regime_scale;
             let effective_tp_bps = self.cfg.tf_take_profit_bps * regime_scale;
