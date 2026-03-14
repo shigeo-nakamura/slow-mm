@@ -557,6 +557,8 @@ pub struct MmEngine {
     tf_peak_price: Option<f64>,
     /// Trend-follow: last stop-loss time (for cooldown)
     tf_last_stop_time: Option<Instant>,
+    /// Consecutive stop-loss count (resets on TP or ema_reverted)
+    tf_consecutive_sl: u32,
     /// Trend-follow: number of trades taken
     tf_trades: u64,
     /// Trend-follow: cumulative realized PnL
@@ -661,6 +663,7 @@ impl MmEngine {
             tf_entry_price: None,
             tf_peak_price: None,
             tf_last_stop_time: None,
+            tf_consecutive_sl: 0,
             tf_trades: 0,
             tf_pnl: 0.0,
             macro_ema_short: None,
@@ -1724,6 +1727,12 @@ impl MmEngine {
                 if pnl_bps <= -(self.cfg.stop_loss_bps) {
                     log::warn!("[MR] STOP-LOSS during wide spread: pnl={:+.1}bps (mid-based)", pnl_bps);
                     self.tf_close_position_market("stop_loss").await;
+                    self.tf_consecutive_sl += 1;
+                    let multiplier = 1u64 << self.tf_consecutive_sl.min(4);
+                    log::info!(
+                        "[MR] Consecutive SL #{}: cooldown {}s ({}x)",
+                        self.tf_consecutive_sl, self.cfg.tf_cooldown_secs * multiplier, multiplier
+                    );
                     self.tf_last_stop_time = Some(Instant::now());
                 }
                 return Ok(());
@@ -1791,14 +1800,34 @@ impl MmEngine {
             if close {
                 log::info!("[MR] CLOSE ({}): pnl={:+.1}bps ema={:+.1}bps", reason, pnl_bps, ema_trend_bps);
                 self.tf_close_position_market(reason).await;
+                if reason == "stop_loss" {
+                    self.tf_consecutive_sl += 1;
+                    let multiplier = 1u64 << self.tf_consecutive_sl.min(4); // 2x, 4x, 8x, 16x cap
+                    let cooldown = self.cfg.tf_cooldown_secs * multiplier;
+                    log::info!(
+                        "[MR] Consecutive SL #{}: cooldown {}s ({}x)",
+                        self.tf_consecutive_sl, cooldown, multiplier
+                    );
+                } else {
+                    if self.tf_consecutive_sl > 0 {
+                        log::info!("[MR] Consecutive SL streak reset (was {})", self.tf_consecutive_sl);
+                    }
+                    self.tf_consecutive_sl = 0;
+                }
                 self.tf_last_stop_time = Some(Instant::now());
             }
 
             self.tf_report_status(mid, pnl_bps).await;
         } else {
-            // 7. Check cooldown
+            // 7. Check cooldown (exponential backoff on consecutive stop-losses)
             if let Some(last) = self.tf_last_stop_time {
-                if last.elapsed() < Duration::from_secs(self.cfg.tf_cooldown_secs) {
+                let multiplier = if self.tf_consecutive_sl > 0 {
+                    1u64 << self.tf_consecutive_sl.min(4)
+                } else {
+                    1
+                };
+                let cooldown_secs = self.cfg.tf_cooldown_secs * multiplier;
+                if last.elapsed() < Duration::from_secs(cooldown_secs) {
                     return Ok(());
                 }
             }
