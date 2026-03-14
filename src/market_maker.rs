@@ -567,6 +567,8 @@ pub struct MmEngine {
     macro_ema_short: Option<f64>,
     /// Macro EMA long (EMA50) for trend pause
     macro_ema_long: Option<f64>,
+    /// Current regime: "range" or "trend"
+    regime: &'static str,
 }
 
 impl MmEngine {
@@ -668,6 +670,7 @@ impl MmEngine {
             tf_pnl: 0.0,
             macro_ema_short: None,
             macro_ema_long: None,
+            regime: "range",
         })
     }
 
@@ -1781,13 +1784,23 @@ impl MmEngine {
             let mut close = false;
             let mut reason = "";
 
+            // Regime-aware take-profit: scale TP with macro trend strength
+            let regime_threshold = 5.0_f64;
+            let macro_abs = macro_trend_bps.abs();
+            let regime_scale = if macro_abs < regime_threshold {
+                1.0
+            } else {
+                (macro_abs / regime_threshold).min(3.0)
+            };
+            let effective_tp_bps = self.cfg.tf_take_profit_bps * regime_scale;
+
             // Stop-loss
             if pnl_bps <= -(self.cfg.stop_loss_bps) {
                 close = true;
                 reason = "stop_loss";
             }
-            // Take-profit
-            else if pnl_bps >= self.cfg.tf_take_profit_bps {
+            // Take-profit (regime-scaled)
+            else if pnl_bps >= effective_tp_bps {
                 close = true;
                 reason = "take_profit";
             }
@@ -1832,14 +1845,41 @@ impl MmEngine {
                 }
             }
 
-            // 8. Trend pause: skip if macro trend is too strong
-            if self.cfg.mr_trend_pause_bps > 0.0 && macro_trend_bps.abs() > self.cfg.mr_trend_pause_bps {
+            // 8. Regime detection: adapt MR parameters to market environment
+            //    macro_trend_bps = EMA10 vs EMA50 divergence (slow indicator)
+            //    Range: small divergence → tight params (low entry, low tp)
+            //    Trend: large divergence → conservative params (high entry, high tp)
+            let regime_threshold = 5.0; // bps: below = range, above = trend
+            let macro_abs = macro_trend_bps.abs();
+            let new_regime = if macro_abs < regime_threshold { "range" } else { "trend" };
+            if new_regime != self.regime {
+                log::info!(
+                    "[MR] Regime change: {} → {} (macro={:+.1}bps)",
+                    self.regime, new_regime, macro_trend_bps
+                );
+                self.regime = new_regime;
+            }
+
+            // Scale entry/tp/stop based on regime
+            // Range: use config values as-is (optimized for mean-reversion)
+            // Trend: scale up entry threshold (harder to enter) and tp (bigger target)
+            let regime_scale = if macro_abs < regime_threshold {
+                1.0
+            } else {
+                // Linear scale: 1.0 at threshold, 2.0 at 2×threshold, capped at 3.0
+                (macro_abs / regime_threshold).min(3.0)
+            };
+            let effective_entry_bps = self.cfg.tf_entry_threshold_bps * regime_scale;
+            let effective_tp_bps = self.cfg.tf_take_profit_bps * regime_scale;
+
+            // Trend pause: skip if macro trend is extremely strong
+            if self.cfg.mr_trend_pause_bps > 0.0 && macro_abs > self.cfg.mr_trend_pause_bps {
                 log::debug!("[MR] Trend pause: macro={:+.1}bps > {}bps", macro_trend_bps, self.cfg.mr_trend_pause_bps);
                 return Ok(());
             }
 
             // 9. Entry: FADE the trend (mean reversion)
-            if ema_trend_bps.abs() >= self.cfg.tf_entry_threshold_bps {
+            if ema_trend_bps.abs() >= effective_entry_bps {
                 // Uptrend → SHORT (expect reversion down)
                 // Downtrend → LONG (expect reversion up)
                 let side = if ema_trend_bps > 0.0 {
@@ -1858,8 +1898,9 @@ impl MmEngine {
                 }
 
                 log::info!(
-                    "[MR] ENTRY: ema={:+.1}bps → {:?} size={} (${:.2}) mid={:.4}",
-                    ema_trend_bps, side, size_dec, size_usd, mid
+                    "[MR] ENTRY: ema={:+.1}bps → {:?} size={} (${:.2}) mid={:.4} [{}] entry≥{:.0}bps tp≥{:.0}bps",
+                    ema_trend_bps, side, size_dec, size_usd, mid,
+                    self.regime, effective_entry_bps, effective_tp_bps
                 );
 
                 match self.main_conn
@@ -1887,7 +1928,7 @@ impl MmEngine {
                     }
                 }
             } else {
-                log::debug!("[MR] Flat, ema={:+.1}bps (threshold={}bps)", ema_trend_bps, self.cfg.tf_entry_threshold_bps);
+                log::debug!("[MR] Flat, ema={:+.1}bps (threshold={:.0}bps) [{}] macro={:+.1}bps", ema_trend_bps, effective_entry_bps, self.regime, macro_trend_bps);
             }
 
             self.tf_report_status(mid, 0.0).await;
