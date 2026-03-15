@@ -119,6 +119,8 @@ struct MmYaml {
     tf_trail_stop_bps: Option<f64>,
     mr_revert_bps: Option<f64>,
     mr_trend_pause_bps: Option<f64>,
+    regime_mid_bps: Option<f64>,
+    regime_max_scale: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +220,10 @@ pub struct MmConfig {
     pub mr_revert_bps: f64,
     /// Pause MR entries when EMA10/EMA50 macro trend exceeds this bps (0 = disabled)
     pub mr_trend_pause_bps: f64,
+    /// Baseline macro divergence for regime scaling (bps). Scale = macro_abs / this.
+    pub regime_mid_bps: f64,
+    /// Maximum regime scale factor (caps how much entry/tp/revert can be scaled up)
+    pub regime_max_scale: f64,
 }
 
 impl MmConfig {
@@ -328,6 +334,8 @@ impl MmConfig {
             tf_trail_stop_bps: yaml.tf_trail_stop_bps.unwrap_or(DEFAULT_TF_TRAIL_STOP_BPS),
             mr_revert_bps: yaml.mr_revert_bps.unwrap_or(DEFAULT_MR_REVERT_BPS),
             mr_trend_pause_bps: yaml.mr_trend_pause_bps.unwrap_or(DEFAULT_MR_TREND_PAUSE_BPS),
+            regime_mid_bps: yaml.regime_mid_bps.unwrap_or(10.0),
+            regime_max_scale: yaml.regime_max_scale.unwrap_or(2.0),
         };
         cfg.apply_env_overrides();
         Ok(cfg)
@@ -433,6 +441,8 @@ impl MmConfig {
             tf_trail_stop_bps: parse_env("TF_TRAIL_STOP_BPS", DEFAULT_TF_TRAIL_STOP_BPS),
             mr_revert_bps: parse_env("MR_REVERT_BPS", DEFAULT_MR_REVERT_BPS),
             mr_trend_pause_bps: parse_env("MR_TREND_PAUSE_BPS", DEFAULT_MR_TREND_PAUSE_BPS),
+            regime_mid_bps: parse_env("REGIME_MID_BPS", 10.0),
+            regime_max_scale: parse_env("REGIME_MAX_SCALE", 2.0),
         };
         cfg.apply_env_overrides();
         Ok(cfg)
@@ -1800,12 +1810,11 @@ impl MmEngine {
             let mut reason = "";
 
             // Regime-aware take-profit: scale TP with macro trend strength
-            let regime_mid_threshold = 5.0_f64;
             let macro_abs = macro_trend_bps.abs();
             let regime_scale = if self.regime == "range" {
                 1.0
             } else {
-                (macro_abs / regime_mid_threshold).max(1.0).min(3.0)
+                (macro_abs / self.cfg.regime_mid_bps).max(1.0).min(self.cfg.regime_max_scale)
             };
             let effective_tp_bps = self.cfg.tf_take_profit_bps * regime_scale;
             let effective_revert_bps = self.cfg.mr_revert_bps * regime_scale;
@@ -1864,9 +1873,9 @@ impl MmEngine {
             // 8. Regime detection with hysteresis to prevent chattering.
             //    Uses asymmetric thresholds: higher to enter trend, lower to exit back to range.
             //    macro_trend_bps = EMA10 vs EMA50 divergence (slow indicator)
-            let regime_enter_threshold = 8.0; // bps: range → trend requires > 8bps
-            let regime_exit_threshold = 3.0;  // bps: trend → range requires < 3bps
-            let regime_mid_threshold = 5.0;   // bps: used for regime scaling baseline
+            // Hysteresis thresholds derived from regime_mid_bps
+            let regime_enter_threshold = self.cfg.regime_mid_bps * 1.6; // range → trend
+            let regime_exit_threshold = self.cfg.regime_mid_bps * 0.6;  // trend → range
             let macro_abs = macro_trend_bps.abs();
             let new_regime = match self.regime {
                 "range" => if macro_abs > regime_enter_threshold { "trend" } else { "range" },
@@ -1880,14 +1889,13 @@ impl MmEngine {
                 self.regime = new_regime;
             }
 
-            // Scale entry/tp/stop based on regime
+            // Scale entry/tp/revert based on regime
             // Range: use config values as-is (optimized for mean-reversion)
-            // Trend: scale up entry threshold (harder to enter) and tp (bigger target)
+            // Trend: scale up (harder to enter, wider tp/revert)
             let regime_scale = if self.regime == "range" {
                 1.0
             } else {
-                // Linear scale: 1.0 at mid_threshold, 2.0 at 2×mid_threshold, capped at 3.0
-                (macro_abs / regime_mid_threshold).max(1.0).min(3.0)
+                (macro_abs / self.cfg.regime_mid_bps).max(1.0).min(self.cfg.regime_max_scale)
             };
             let effective_entry_bps = self.cfg.tf_entry_threshold_bps * regime_scale;
             let effective_tp_bps = self.cfg.tf_take_profit_bps * regime_scale;

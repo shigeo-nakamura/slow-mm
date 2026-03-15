@@ -140,19 +140,22 @@ def precompute_emas(prices, ema_short=None, ema_long=None,
     return trend_bps, macro_bps
 
 
-def _regime_scale(macro_abs, regime, regime_mid=5.0, regime_enter=8.0, regime_exit=3.0):
-    """Compute regime and scale factor, matching Rust MmEngine logic."""
+def _regime_scale(macro_abs, regime, regime_mid=10.0, max_scale=2.0):
+    """Compute regime and scale factor, matching Rust MmEngine logic.
+    Hysteresis thresholds derived from regime_mid: enter=1.6×, exit=0.6×."""
+    regime_enter = regime_mid * 1.6
+    regime_exit = regime_mid * 0.6
     if regime == "range":
         new_regime = "trend" if macro_abs > regime_enter else "range"
     else:
         new_regime = "range" if macro_abs < regime_exit else "trend"
-    scale = 1.0 if new_regime == "range" else min(max(macro_abs / regime_mid, 1.0), 3.0)
+    scale = 1.0 if new_regime == "range" else min(max(macro_abs / regime_mid, 1.0), max_scale)
     return new_regime, scale
 
 
 def backtest_mr(prices, trend_bps_arr, entry_bps, stop_bps, tp_bps, revert_bps,
                 equity=970.0, order_size_pct=0.10, half_spread_bps=0.0,
-                macro_bps_arr=None):
+                macro_bps_arr=None, regime_mid=10.0, max_scale=2.0):
     """Mean Reversion: fade EMA divergence, exit on TP/SL/revert.
 
     If macro_bps_arr is provided, entry/tp/revert are scaled by regime
@@ -172,7 +175,7 @@ def backtest_mr(prices, trend_bps_arr, entry_bps, stop_bps, tp_bps, revert_bps,
 
         # Compute regime scale if macro data available
         if macro_bps_arr is not None:
-            regime, scale = _regime_scale(abs(macro_bps_arr[i]), regime)
+            regime, scale = _regime_scale(abs(macro_bps_arr[i]), regime, regime_mid, max_scale)
         else:
             scale = 1.0
 
@@ -301,7 +304,8 @@ def backtest_mr_hedge(prices, trend_bps_arr, entry_bps, stop_bps, tp_bps, revert
 
 def backtest_mr_trend_pause(prices, trend_bps_arr, macro_bps_arr,
                             entry_bps, stop_bps, tp_bps, revert_bps, macro_pause_bps,
-                            equity=970.0, order_size_pct=0.10, half_spread_bps=0.0):
+                            equity=970.0, order_size_pct=0.10, half_spread_bps=0.0,
+                            regime_mid=10.0, max_scale=2.0):
     """MR + Trend Pause + Regime Scale: skip entry when macro too strong,
     and scale entry/tp/revert by regime."""
     direction = 0
@@ -317,7 +321,7 @@ def backtest_mr_trend_pause(prices, trend_bps_arr, macro_bps_arr,
         tb = trend_bps_arr[i]
         mb = macro_bps_arr[i]
 
-        regime, scale = _regime_scale(abs(mb), regime)
+        regime, scale = _regime_scale(abs(mb), regime, regime_mid, max_scale)
         eff_entry = entry_bps * scale
         eff_tp = tp_bps * scale
         eff_revert = revert_bps * scale

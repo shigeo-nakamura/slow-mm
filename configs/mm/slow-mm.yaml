@@ -19,12 +19,16 @@ ema_long_periods: 20
 
 # Mean-reversion parameters (optimized via 30-day backtest WITH spread cost + regime_scale)
 # Spread: median 15.4bps (half=7.7bps/side). Entry/TP/revert auto-scale with regime.
-# Backtest: PnL=$591/30d, 68.4% win, maxDD $2.09, 0.38 trades/10min (auto-updated 2026-03-15)
-tf_entry_threshold_bps: 20.0  # Base entry (range); trend scales to 30-60bps
+# Backtest: PnL=$598/30d, 73.4% win, maxDD $2.11, 0.37 trades/10min (auto-updated 2026-03-15)
+tf_entry_threshold_bps: 25.0  # Base entry (range); trend scales up to 62.5bps
 stop_loss_bps: 50.0           # Wide stop-loss (avoid noise stops)
-tf_take_profit_bps: 15.0      # Base TP (range); trend scales to 22-45bps
-mr_revert_bps: 8.0            # Base revert (range); trend scales to 12-24bps
+tf_take_profit_bps: 5.0       # Base TP (range); trend scales up to 12.5bps
+mr_revert_bps: 10.0           # Base revert (range); trend scales up to 25bps
 tf_cooldown_secs: 60          # 60s cooldown after close
+
+# Regime scaling: scale entry/tp/revert by macro trend strength
+regime_mid_bps: 10.0          # Baseline for scaling (scale=macro/this)
+regime_max_scale: 2.5         # Cap on scale factor
 
 # Trend pause: skip MR entry when macro EMA divergence exceeds this threshold.
 # Prevents counter-trend entries during strong directional moves.
