@@ -1,8 +1,8 @@
-symbol: LIT
+symbol: HYPE
 dry_run: false
 strategy_mode: mean_reversion
-price_decimals: 4              # LIT: $1.1050 (0.0001 tick)
-size_decimals: 2               # LIT: 209.42 (0.01 step)
+price_decimals: 2              # HYPE: $33.89 (0.01 tick)
+size_decimals: 2               # HYPE: 0.50 min_order (0.01 step)
 
 # Spot hedge: empty = disabled (no hedge for MR scalping)
 spot_hedge_symbol: ""
@@ -17,13 +17,13 @@ order_size_pct: 0.10          # 10% of equity per trade
 ema_short_periods: 4
 ema_long_periods: 20
 
-# Mean-reversion parameters (optimized via 30-day backtest WITH spread cost + regime_scale)
-# Spread: median 15.4bps (half=7.7bps/side). Entry/TP/revert auto-scale with regime.
-# Backtest: PnL=$598/30d, 73.4% win, maxDD $2.11, 0.37 trades/10min (auto-updated 2026-03-15)
-tf_entry_threshold_bps: 25.0  # Base entry (range); trend scales up to 62.5bps
-stop_loss_bps: 50.0           # Wide stop-loss (avoid noise stops)
-tf_take_profit_bps: 5.0       # Base TP (range); trend scales up to 12.5bps
-mr_revert_bps: 10.0           # Base revert (range); trend scales up to 25bps
+# Mean-reversion parameters (optimized via 30-day backtest WITH spread cost)
+# HYPE spread: median 4.7bps (half=2.4bps/side). Entry/TP/revert auto-scale with regime.
+# Backtest @4bp: PnL=$1592/30d, 76% win, maxDD $14.24, e=20 s=80 t=15 r=10
+tf_entry_threshold_bps: 20.0  # Base entry (range); trend scales up
+stop_loss_bps: 80.0           # Wide stop-loss
+tf_take_profit_bps: 15.0      # Base TP (range); trend scales up
+mr_revert_bps: 10.0           # Base revert (range); trend scales up
 tf_cooldown_secs: 60          # 60s cooldown after close
 
 # Regime scaling: scale entry/tp/revert by macro trend strength
