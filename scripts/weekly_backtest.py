@@ -35,6 +35,11 @@ STATUS_DIR = os.getenv(
 STATUS_ID = os.getenv("DEBOT_STATUS_ID", "slow-mm")
 ALERT_FILE = os.path.join(STATUS_DIR, STATUS_ID, "backtest_alert.json")
 LOOKBACK_DAYS = 7
+# Data interval vs bot interval: data is 20s, bot is 5s → scale EMA periods by 4x
+# When running grid search on 20s data, use EMA/4. When writing YAML, multiply back by 4.
+DATA_INTERVAL_SECS = 20
+BOT_INTERVAL_SECS = 5
+EMA_SCALE = DATA_INTERVAL_SECS // BOT_INTERVAL_SECS  # 4
 
 
 def load_config(path):
@@ -51,13 +56,14 @@ def update_yaml_params(config_path, params, old_result, new_result):
     with open(config_path) as f:
         content = f.read()
 
+    # EMA periods in params are for data interval; scale back to bot interval for YAML
     replacements = {
         "tf_entry_threshold_bps": float(params["entry"]),
         "stop_loss_bps": float(params["stop"]),
         "tf_take_profit_bps": float(params["tp"]),
         "mr_revert_bps": float(params["revert"]),
-        "ema_short_periods": int(params.get("ema_short", 5)),
-        "ema_long_periods": int(params.get("ema_long", 20)),
+        "ema_short_periods": int(params.get("ema_short", 1)) * EMA_SCALE,
+        "ema_long_periods": int(params.get("ema_long", 5)) * EMA_SCALE,
         "mr_trend_pause_bps": int(params.get("macro_pause", 0)),
     }
     for key, val in replacements.items():
@@ -102,14 +108,19 @@ def main():
     max_spread = cfg.get("max_spread_bps", 50.0)
     equity = cfg.get("equity_usd_fallback", 500.0)
     order_size_pct = cfg.get("order_size_pct", 0.10)
-    ema_short = cfg.get("ema_short_periods", 5)
-    ema_long = cfg.get("ema_long_periods", 20)
+    # EMA periods in config are for bot interval (5s).
+    # Scale down for 20s data backtest.
+    ema_short = max(1, cfg.get("ema_short_periods", 5) // EMA_SCALE)
+    ema_long = max(2, cfg.get("ema_long_periods", 20) // EMA_SCALE)
     macro_pause_bps = cfg.get("mr_trend_pause_bps", 0)
 
     print(f"[BACKTEST] Loading data: {data_file} (last {LOOKBACK_DAYS} days, max_spread={max_spread}bps)")
     prices, stats = load_ticks(data_file, max_spread_bps=max_spread, lookback_days=LOOKBACK_DAYS)
+    half_spread = stats.get("median_half_spread_bps", 0.0)
     print(f"[BACKTEST] Loaded {stats['kept']}/{stats['total']} ticks "
           f"(skipped: {stats['skipped_wide']} wide spread, {stats['skipped_missing']} missing bid/ask)")
+    print(f"[BACKTEST] Spread cost: median={stats.get('median_spread_bps', 0)}bps "
+          f"mean={stats.get('mean_spread_bps', 0)}bps → half_spread={half_spread}bps per side")
 
     if len(prices) < 100:
         print("[BACKTEST] Not enough data, skipping")
@@ -123,11 +134,13 @@ def main():
             prices, trend_bps_arr, macro_bps_arr,
             entry_bps, stop_bps, tp_bps, revert_bps, macro_pause_bps,
             equity=equity, order_size_pct=order_size_pct,
+            half_spread_bps=half_spread,
         )
     else:
         trades, wins, pnl, max_dd, _ = backtest_mr(
             prices, trend_bps_arr, entry_bps, stop_bps, tp_bps, revert_bps,
             equity=equity, order_size_pct=order_size_pct,
+            half_spread_bps=half_spread,
         )
     result = result_dict(prices, trades, wins, pnl, max_dd)
     print(f"[BACKTEST] Current config: PnL=${result['pnl']} winR={result['win_rate']}% "
@@ -139,8 +152,9 @@ def main():
     best_params = {"entry": entry_bps, "stop": stop_bps, "tp": tp_bps, "revert": revert_bps,
                    "ema_short": ema_short, "ema_long": ema_long, "macro_pause": macro_pause_bps}
 
-    ema_short_list = [5, 10, 20]
-    ema_long_list = [20, 40, 80]
+    # EMA grid for 20s data (bot values = these × EMA_SCALE)
+    ema_short_list = [1, 2, 3, 5]
+    ema_long_list = [5, 10, 15, 20]
     macro_pause_list = [0, 30, 50, 80]
 
     for es, el in [(s, l) for s in ema_short_list for l in ema_long_list if l > s]:
@@ -154,11 +168,13 @@ def main():
                                 tr, wi, pn, md, _ = backtest_mr_trend_pause(
                                     prices, t_arr, m_arr, e, s, t, r, mp,
                                     equity=equity, order_size_pct=order_size_pct,
+                                    half_spread_bps=half_spread,
                                 )
                             else:
                                 tr, wi, pn, md, _ = backtest_mr(
                                     prices, t_arr, e, s, t, r,
                                     equity=equity, order_size_pct=order_size_pct,
+                                    half_spread_bps=half_spread,
                                 )
                             res = result_dict(prices, tr, wi, pn, md)
                             if res["trades_per_10min"] >= 0.5 and res["pnl"] > best_pnl:
@@ -173,12 +189,14 @@ def main():
             prices, t_arr, m_arr,
             bp["entry"], bp["stop"], bp["tp"], bp["revert"], bp["macro_pause"],
             equity=equity, order_size_pct=order_size_pct,
+            half_spread_bps=half_spread,
         )
     else:
         best_trades, best_wins, best_pnl_val, best_max_dd, _ = backtest_mr(
             prices, t_arr,
             bp["entry"], bp["stop"], bp["tp"], bp["revert"],
             equity=equity, order_size_pct=order_size_pct,
+            half_spread_bps=half_spread,
         )
     best_result = result_dict(prices, best_trades, best_wins, best_pnl_val, best_max_dd)
 

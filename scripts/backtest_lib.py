@@ -26,6 +26,7 @@ def load_ticks(path, max_spread_bps=50.0, lookback_days=None):
 
     Returns list of (timestamp_ms, mid_price) tuples where spread <= max_spread_bps.
     Ticks with missing bid/ask are skipped.
+    Stats include spread distribution (median/mean half-spread in bps).
     """
     ticks = []
     cutoff_ms = 0
@@ -35,6 +36,7 @@ def load_ticks(path, max_spread_bps=50.0, lookback_days=None):
     skipped_wide = 0
     skipped_missing = 0
     total = 0
+    spreads_bps = []
 
     with open(path) as f:
         for line in f:
@@ -73,14 +75,27 @@ def load_ticks(path, max_spread_bps=50.0, lookback_days=None):
                         if spread_bps > max_spread_bps:
                             skipped_wide += 1
                             continue
+                        spreads_bps.append(spread_bps)
                         mid = (bid + ask) / 2.0
                 else:
                     skipped_missing += 1
 
             ticks.append((ts, mid))
 
+    # Spread statistics
+    if spreads_bps:
+        spreads_bps.sort()
+        median_spread = spreads_bps[len(spreads_bps) // 2]
+        mean_spread = sum(spreads_bps) / len(spreads_bps)
+    else:
+        median_spread = 0.0
+        mean_spread = 0.0
+
     return ticks, {"total": total, "kept": len(ticks),
-                    "skipped_wide": skipped_wide, "skipped_missing": skipped_missing}
+                    "skipped_wide": skipped_wide, "skipped_missing": skipped_missing,
+                    "median_spread_bps": round(median_spread, 2),
+                    "mean_spread_bps": round(mean_spread, 2),
+                    "median_half_spread_bps": round(median_spread / 2, 2)}
 
 
 def precompute_emas(prices, ema_short=None, ema_long=None,
