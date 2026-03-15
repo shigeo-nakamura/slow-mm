@@ -11,9 +11,10 @@ Provides:
 - backtest_mr_trend_pause(): MR + Trend Pause backtest
 """
 import json
+import os
 import time
 
-SYMBOL = "LIT"
+SYMBOL = os.environ.get("BACKTEST_SYMBOL", "LIT")
 DEFAULT_EMA_SHORT = 5
 DEFAULT_EMA_LONG = 20
 DEFAULT_EMA_MACRO_SHORT = 10
