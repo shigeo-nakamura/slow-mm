@@ -35,11 +35,6 @@ STATUS_DIR = os.getenv(
 STATUS_ID = os.getenv("DEBOT_STATUS_ID", "slow-mm")
 ALERT_FILE = os.path.join(STATUS_DIR, STATUS_ID, "backtest_alert.json")
 LOOKBACK_DAYS = 7
-# Data interval vs bot interval: data is 20s, bot is 5s → scale EMA periods by 4x
-# When running grid search on 20s data, use EMA/4. When writing YAML, multiply back by 4.
-DATA_INTERVAL_SECS = 20
-BOT_INTERVAL_SECS = 5
-EMA_SCALE = DATA_INTERVAL_SECS // BOT_INTERVAL_SECS  # 4
 
 
 def load_config(path):
@@ -47,7 +42,7 @@ def load_config(path):
         return yaml.safe_load(f)
 
 
-def update_yaml_params(config_path, params, old_result, new_result):
+def update_yaml_params(config_path, params, old_result, new_result, ema_scale=1):
     """Update YAML config with new params, keeping a .prev backup for rollback."""
     prev_path = config_path + ".prev"
     shutil.copy2(config_path, prev_path)
@@ -62,8 +57,8 @@ def update_yaml_params(config_path, params, old_result, new_result):
         "stop_loss_bps": float(params["stop"]),
         "tf_take_profit_bps": float(params["tp"]),
         "mr_revert_bps": float(params["revert"]),
-        "ema_short_periods": int(params.get("ema_short", 1)) * EMA_SCALE,
-        "ema_long_periods": int(params.get("ema_long", 5)) * EMA_SCALE,
+        "ema_short_periods": int(params.get("ema_short", 1)) * ema_scale,
+        "ema_long_periods": int(params.get("ema_long", 5)) * ema_scale,
         "mr_trend_pause_bps": int(params.get("macro_pause", 0)),
     }
     for key, val in replacements.items():
@@ -108,17 +103,17 @@ def main():
     max_spread = cfg.get("max_spread_bps", 50.0)
     equity = cfg.get("equity_usd_fallback", 500.0)
     order_size_pct = cfg.get("order_size_pct", 0.10)
-    # EMA periods in config are for bot interval (5s).
-    # Scale down for 20s data backtest.
-    ema_short = max(1, cfg.get("ema_short_periods", 5) // EMA_SCALE)
-    ema_long = max(2, cfg.get("ema_long_periods", 20) // EMA_SCALE)
+    bot_interval = cfg.get("interval_secs", 5)
     macro_pause_bps = cfg.get("mr_trend_pause_bps", 0)
 
     print(f"[BACKTEST] Loading data: {data_file} (last {LOOKBACK_DAYS} days, max_spread={max_spread}bps)")
     prices, stats = load_ticks(data_file, max_spread_bps=max_spread, lookback_days=LOOKBACK_DAYS)
     half_spread = stats.get("median_half_spread_bps", 0.0)
+    data_interval = stats.get("data_interval_secs", bot_interval)
+    ema_scale = max(1, data_interval // bot_interval)
     print(f"[BACKTEST] Loaded {stats['kept']}/{stats['total']} ticks "
           f"(skipped: {stats['skipped_wide']} wide spread, {stats['skipped_missing']} missing bid/ask)")
+    print(f"[BACKTEST] Data interval: {data_interval}s, bot interval: {bot_interval}s → EMA scale: {ema_scale}x")
     print(f"[BACKTEST] Spread cost: median={stats.get('median_spread_bps', 0)}bps "
           f"mean={stats.get('mean_spread_bps', 0)}bps → half_spread={half_spread}bps per side")
 
@@ -126,6 +121,9 @@ def main():
         print("[BACKTEST] Not enough data, skipping")
         return
 
+    # EMA periods in config are for bot interval; scale down for data interval
+    ema_short = max(1, cfg.get("ema_short_periods", 5) // ema_scale)
+    ema_long = max(2, cfg.get("ema_long_periods", 20) // ema_scale)
     trend_bps_arr, macro_bps_arr = precompute_emas(prices, ema_short, ema_long)
 
     # Run with current config
@@ -140,7 +138,7 @@ def main():
         trades, wins, pnl, max_dd, _ = backtest_mr(
             prices, trend_bps_arr, entry_bps, stop_bps, tp_bps, revert_bps,
             equity=equity, order_size_pct=order_size_pct,
-            half_spread_bps=half_spread,
+            half_spread_bps=half_spread, macro_bps_arr=macro_bps_arr,
         )
     result = result_dict(prices, trades, wins, pnl, max_dd)
     print(f"[BACKTEST] Current config: PnL=${result['pnl']} winR={result['win_rate']}% "
@@ -152,9 +150,9 @@ def main():
     best_params = {"entry": entry_bps, "stop": stop_bps, "tp": tp_bps, "revert": revert_bps,
                    "ema_short": ema_short, "ema_long": ema_long, "macro_pause": macro_pause_bps}
 
-    # EMA grid for 20s data (bot values = these × EMA_SCALE)
-    ema_short_list = [1, 2, 3, 5]
-    ema_long_list = [5, 10, 15, 20]
+    # EMA grid scaled for data interval (bot values = these × ema_scale)
+    ema_short_list = sorted(set(max(1, v // ema_scale) for v in [4, 8, 12, 20]))
+    ema_long_list = sorted(set(max(2, v // ema_scale) for v in [20, 40, 60, 80]))
     macro_pause_list = [0, 30, 50, 80]
 
     for es, el in [(s, l) for s in ema_short_list for l in ema_long_list if l > s]:
@@ -174,7 +172,7 @@ def main():
                                 tr, wi, pn, md, _ = backtest_mr(
                                     prices, t_arr, e, s, t, r,
                                     equity=equity, order_size_pct=order_size_pct,
-                                    half_spread_bps=half_spread,
+                                    half_spread_bps=half_spread, macro_bps_arr=m_arr,
                                 )
                             res = result_dict(prices, tr, wi, pn, md)
                             if res["trades_per_10min"] >= 0.5 and res["pnl"] > best_pnl:
@@ -195,7 +193,7 @@ def main():
         best_trades, best_wins, best_pnl_val, best_max_dd, _ = backtest_mr(
             prices, t_arr,
             bp["entry"], bp["stop"], bp["tp"], bp["revert"],
-            equity=equity, order_size_pct=order_size_pct,
+            equity=equity, order_size_pct=order_size_pct, macro_bps_arr=m_arr,
             half_spread_bps=half_spread,
         )
     best_result = result_dict(prices, best_trades, best_wins, best_pnl_val, best_max_dd)
@@ -227,7 +225,7 @@ def main():
     old_params = current_params
     if params_changed and best_pnl > 0:
         try:
-            update_yaml_params(config_file, best_params, result, best_result)
+            update_yaml_params(config_file, best_params, result, best_result, ema_scale)
             config_updated = True
             alert_msg += " | CONFIG AUTO-UPDATED (restart to apply)"
             print(f"[BACKTEST] Config auto-updated: {config_file}")

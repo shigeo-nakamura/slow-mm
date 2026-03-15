@@ -91,11 +91,20 @@ def load_ticks(path, max_spread_bps=50.0, lookback_days=None):
         median_spread = 0.0
         mean_spread = 0.0
 
+    # Data interval (median tick-to-tick gap in seconds)
+    if len(ticks) > 1:
+        gaps = [(ticks[i][0] - ticks[i-1][0]) / 1000.0 for i in range(1, min(len(ticks), 10001))]
+        gaps.sort()
+        data_interval_secs = round(gaps[len(gaps) // 2])
+    else:
+        data_interval_secs = 0
+
     return ticks, {"total": total, "kept": len(ticks),
                     "skipped_wide": skipped_wide, "skipped_missing": skipped_missing,
                     "median_spread_bps": round(median_spread, 2),
                     "mean_spread_bps": round(mean_spread, 2),
-                    "median_half_spread_bps": round(median_spread / 2, 2)}
+                    "median_half_spread_bps": round(median_spread / 2, 2),
+                    "data_interval_secs": data_interval_secs}
 
 
 def precompute_emas(prices, ema_short=None, ema_long=None,
@@ -293,18 +302,25 @@ def backtest_mr_hedge(prices, trend_bps_arr, entry_bps, stop_bps, tp_bps, revert
 def backtest_mr_trend_pause(prices, trend_bps_arr, macro_bps_arr,
                             entry_bps, stop_bps, tp_bps, revert_bps, macro_pause_bps,
                             equity=970.0, order_size_pct=0.10, half_spread_bps=0.0):
-    """MR + Trend Pause: skip entry when macro EMA divergence is too strong."""
+    """MR + Trend Pause + Regime Scale: skip entry when macro too strong,
+    and scale entry/tp/revert by regime."""
     direction = 0
     entry_mid = 0.0
     cooldown = 0
     trades = wins = 0
     pnl = peak_pnl = max_dd = 0.0
     hold_total = hold = 0
+    regime = "range"
 
     for i in range(len(prices)):
         mid = prices[i][1]
         tb = trend_bps_arr[i]
         mb = macro_bps_arr[i]
+
+        regime, scale = _regime_scale(abs(mb), regime)
+        eff_entry = entry_bps * scale
+        eff_tp = tp_bps * scale
+        eff_revert = revert_bps * scale
 
         if direction != 0:
             hold += 1
@@ -317,9 +333,9 @@ def backtest_mr_trend_pause(prices, trend_bps_arr, macro_bps_arr,
             close = False
             if pnl_bps <= -stop_bps:
                 close = True
-            elif pnl_bps >= tp_bps:
+            elif pnl_bps >= eff_tp:
                 close = True
-            elif abs(tb) <= revert_bps:
+            elif abs(tb) <= eff_revert:
                 close = True
 
             if close:
@@ -341,7 +357,7 @@ def backtest_mr_trend_pause(prices, trend_bps_arr, macro_bps_arr,
                 continue
             if abs(mb) >= macro_pause_bps:
                 continue
-            if abs(tb) >= entry_bps:
+            if abs(tb) >= eff_entry:
                 direction = -1 if tb > 0 else 1
                 entry_mid = mid
                 hold = 0
