@@ -131,19 +131,45 @@ def precompute_emas(prices, ema_short=None, ema_long=None,
     return trend_bps, macro_bps
 
 
+def _regime_scale(macro_abs, regime, regime_mid=5.0, regime_enter=8.0, regime_exit=3.0):
+    """Compute regime and scale factor, matching Rust MmEngine logic."""
+    if regime == "range":
+        new_regime = "trend" if macro_abs > regime_enter else "range"
+    else:
+        new_regime = "range" if macro_abs < regime_exit else "trend"
+    scale = 1.0 if new_regime == "range" else min(max(macro_abs / regime_mid, 1.0), 3.0)
+    return new_regime, scale
+
+
 def backtest_mr(prices, trend_bps_arr, entry_bps, stop_bps, tp_bps, revert_bps,
-                equity=970.0, order_size_pct=0.10, half_spread_bps=0.0):
-    """Mean Reversion: fade EMA divergence, exit on TP/SL/revert."""
+                equity=970.0, order_size_pct=0.10, half_spread_bps=0.0,
+                macro_bps_arr=None):
+    """Mean Reversion: fade EMA divergence, exit on TP/SL/revert.
+
+    If macro_bps_arr is provided, entry/tp/revert are scaled by regime
+    (matching the Rust engine's regime_scale logic).
+    """
     direction = 0
     entry_mid = 0.0
     cooldown = 0
     trades = wins = 0
     pnl = peak_pnl = max_dd = 0.0
     hold_total = hold = 0
+    regime = "range"
 
     for i in range(len(prices)):
         mid = prices[i][1]
         tb = trend_bps_arr[i]
+
+        # Compute regime scale if macro data available
+        if macro_bps_arr is not None:
+            regime, scale = _regime_scale(abs(macro_bps_arr[i]), regime)
+        else:
+            scale = 1.0
+
+        eff_entry = entry_bps * scale
+        eff_tp = tp_bps * scale
+        eff_revert = revert_bps * scale
 
         if direction != 0:
             hold += 1
@@ -156,9 +182,9 @@ def backtest_mr(prices, trend_bps_arr, entry_bps, stop_bps, tp_bps, revert_bps,
             close = False
             if pnl_bps <= -stop_bps:
                 close = True
-            elif pnl_bps >= tp_bps:
+            elif pnl_bps >= eff_tp:
                 close = True
-            elif abs(tb) <= revert_bps:
+            elif abs(tb) <= eff_revert:
                 close = True
 
             if close:
@@ -178,7 +204,7 @@ def backtest_mr(prices, trend_bps_arr, entry_bps, stop_bps, tp_bps, revert_bps,
             if cooldown > 0:
                 cooldown -= 1
                 continue
-            if abs(tb) >= entry_bps:
+            if abs(tb) >= eff_entry:
                 direction = -1 if tb > 0 else 1
                 entry_mid = mid
                 hold = 0

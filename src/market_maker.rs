@@ -1808,6 +1808,7 @@ impl MmEngine {
                 (macro_abs / regime_mid_threshold).max(1.0).min(3.0)
             };
             let effective_tp_bps = self.cfg.tf_take_profit_bps * regime_scale;
+            let effective_revert_bps = self.cfg.mr_revert_bps * regime_scale;
 
             // Stop-loss
             if pnl_bps <= -(self.cfg.stop_loss_bps) {
@@ -1819,8 +1820,8 @@ impl MmEngine {
                 close = true;
                 reason = "take_profit";
             }
-            // Mean reversion exit: EMA converged back
-            else if ema_trend_bps.abs() <= self.cfg.mr_revert_bps {
+            // Mean reversion exit: EMA converged back (regime-scaled)
+            else if ema_trend_bps.abs() <= effective_revert_bps {
                 close = true;
                 reason = "ema_reverted";
             }
@@ -1890,6 +1891,7 @@ impl MmEngine {
             };
             let effective_entry_bps = self.cfg.tf_entry_threshold_bps * regime_scale;
             let effective_tp_bps = self.cfg.tf_take_profit_bps * regime_scale;
+            let effective_revert_bps = self.cfg.mr_revert_bps * regime_scale;
 
             // Trend pause: skip if macro trend is extremely strong
             if self.cfg.mr_trend_pause_bps > 0.0 && macro_abs > self.cfg.mr_trend_pause_bps {
@@ -1917,9 +1919,9 @@ impl MmEngine {
                 }
 
                 log::info!(
-                    "[MR] ENTRY: ema={:+.1}bps → {:?} size={} (${:.2}) mid={:.4} [{}] entry≥{:.0}bps tp≥{:.0}bps",
+                    "[MR] ENTRY: ema={:+.1}bps → {:?} size={} (${:.2}) mid={:.4} [{}] entry≥{:.0}bps tp≥{:.0}bps revert≤{:.0}bps",
                     ema_trend_bps, side, size_dec, size_usd, mid,
-                    self.regime, effective_entry_bps, effective_tp_bps
+                    self.regime, effective_entry_bps, effective_tp_bps, effective_revert_bps
                 );
 
                 match self.main_conn
