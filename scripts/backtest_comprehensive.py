@@ -159,65 +159,79 @@ def main():
         v = ema_scores.get(default_ema, -float("inf"))
         print(f"  es={default_ema[0]:<3} el={default_ema[1]:<3} ms={default_ema[2]:<3} ml={default_ema[3]:<3} -> screening PnL=${v:.2f} (default, added)")
 
-    # Phase 2: Full MR + Regime grid for each top EMA candidate
-    print(f"\n--- Phase 2: Full grid search for top {len(top_ema_keys)} EMA candidates ---")
-    overall_best = {}  # spread -> (pnl, params_str, trades, wins, max_dd, es, el, ems, eml, rm, rms)
+    # Use best EMA params for the rest
+    if top_emas:
+        best_ema_key = top_emas[0][0]
+        best_es, best_el, best_ems, best_eml = best_ema_key
+    else:
+        best_es, best_el, best_ems, best_eml = default_ema
+    print(f"\n  Best EMA (data): short={best_es} long={best_el} macro_short={best_ems} macro_long={best_eml}")
+    print(f"  Best EMA (bot):  short={best_es*ema_scale} long={best_el*ema_scale} "
+          f"macro_short={best_ems*ema_scale} macro_long={best_eml*ema_scale}")
 
-    for ema_idx, (es, el, ems, eml) in enumerate(top_ema_keys):
-        t_arr, m_arr = precompute_emas(prices, es, el, ems, eml)
-        marker = " (default)" if (es, el, ems, eml) == default_ema else ""
-        print(f"\n  [{ema_idx+1}/{len(top_ema_keys)}] EMA s={es}/l={el}/ms={ems}/ml={eml}{marker}")
-
-        for spread_bps in SPREAD_BPS_LIST:
-            half_spread = spread_bps / 2.0
-            local_best_pnl = -float("inf")
-            local_best = None
-            for e, s, t, r in product(ENTRY_LIST, STOP_LIST, TP_LIST, REVERT_LIST):
-                for rm, rms in product(REGIME_MID_LIST, REGIME_MAX_SCALE_LIST):
-                    trades, wins, pnl, max_dd, avg_hold = backtest_mr(
-                        prices, t_arr, e, s, t, r,
-                        equity=EQUITY, order_size_pct=ORDER_SIZE_PCT,
-                        half_spread_bps=half_spread,
-                        macro_bps_arr=m_arr, regime_mid=rm, max_scale=rms,
-                    )
-                    tpm = trades / (duration_min / 10.0) if duration_min > 0 else 0
-                    if tpm >= MIN_TRADES_PER_10MIN and pnl > local_best_pnl:
-                        local_best_pnl = pnl
-                        local_best = (pnl, f"e={e:>3} s={s:>3} t={t:>3} r={r:>3}",
-                                      trades, wins, max_dd, es, el, ems, eml, rm, rms)
-
-            if local_best is not None:
-                pnl = local_best[0]
-                prev = overall_best.get(spread_bps)
-                if prev is None or pnl > prev[0]:
-                    overall_best[spread_bps] = local_best
-                wr = local_best[3] / local_best[2] * 100 if local_best[2] > 0 else 0
-                print(f"    {spread_bps:>2}bp: ${pnl:>8.2f} maxDD=${local_best[4]:>7.2f} "
-                      f"trades={local_best[2]:>5} wr={wr:.0f}% {local_best[1]} "
-                      f"regime mid={local_best[9]} scale={local_best[10]}")
-
-    # Print MR summary and update grand_summary
-    print(f"\n--- MR Best per spread (across all EMA/regime combos) ---")
-    print(f"{'Spread':>6} | {'PnL':>9} {'maxDD':>8} {'trades':>7} {'winR':>5} | {'MR params':<24} | EMA | Regime")
-    print("-" * 130)
-    best_es = best_el = best_ems = best_eml = best_rm = best_rms = None
-    for spread_bps in SPREAD_BPS_LIST:
-        if spread_bps in overall_best:
-            ob = overall_best[spread_bps]
-            pnl, params, trades, wins, max_dd, es, el, ems, eml, rm, rms = ob
-            wr = wins / trades * 100 if trades > 0 else 0
-            print(f"{spread_bps:>4}bp | ${pnl:>8.2f} ${max_dd:>7.2f} {trades:>7} {wr:>4.0f}% | {params} | "
-                  f"s={es*ema_scale}/l={el*ema_scale}/ms={ems*ema_scale}/ml={eml*ema_scale} (bot) | mid={rm}/scale={rms}")
-            update_grand("MR", spread_bps, pnl, params, trades, wins, max_dd)
-            if best_es is None:  # Use 0bp best for downstream strategies
-                best_es, best_el, best_ems, best_eml = es, el, ems, eml
-                best_rm, best_rms = rm, rms
-
-    if best_es is None:
-        best_es, best_el, best_ems, best_eml = 5, 20, 10, 50
-        best_rm, best_rms = 10.0, 2.0
-
+    # Phase 2: Regime grid search with best EMA (representative MR params)
     best_trend_arr, best_macro_arr = precompute_emas(prices, best_es, best_el, best_ems, best_eml)
+    print(f"\n--- Phase 2: Regime grid search (best EMA, 0bp spread) ---")
+    regime_results = []
+    for rm, rms in product(REGIME_MID_LIST, REGIME_MAX_SCALE_LIST):
+        for e, s, t, r in product([10, 20, 30], [30, 50, 80], [5, 10, 15], [5, 10]):
+            trades, wins, pnl, max_dd, avg_hold = backtest_mr(
+                prices, best_trend_arr, e, s, t, r,
+                equity=EQUITY, order_size_pct=ORDER_SIZE_PCT, half_spread_bps=0.0,
+                macro_bps_arr=best_macro_arr, regime_mid=rm, max_scale=rms,
+            )
+            tpm = trades / (duration_min / 10.0) if duration_min > 0 else 0
+            if tpm >= MIN_TRADES_PER_10MIN:
+                regime_results.append((pnl, rm, rms, e, s, t, r, trades, wins, max_dd, avg_hold, tpm))
+
+    regime_results.sort(key=lambda x: -x[0])
+    print(f"\n{'Regime params':<22} {'MR params':<24} | {'trades':>6} {'wins':>5} {'winR':>5} | {'PnL':>9} {'maxDD':>8} | {'t/10m':>5} {'hold':>6}")
+    print("-" * 130)
+    for row in regime_results[:15]:
+        pnl, rm, rms, e, s, t, r, trades, wins, max_dd, avg_hold, tpm = row
+        wr = wins / trades * 100 if trades > 0 else 0
+        hold_s = avg_hold * tick_sec
+        print(f"mid={rm:<5} scale={rms:<4} | "
+              f"e={e:<3} s={s:<3} t={t:<3} r={r:<3} | "
+              f"{trades:>6} {wins:>5} {wr:>4.0f}% | "
+              f"${pnl:>8.2f} ${max_dd:>7.2f} | {tpm:>5.2f} {hold_s:>6.0f}s")
+    print(f"  ({len(regime_results)} qualifying combos)")
+
+    if regime_results:
+        best_rm, best_rms = regime_results[0][1], regime_results[0][2]
+    else:
+        best_rm, best_rms = 10.0, 2.0
+    print(f"\n  Best Regime: mid={best_rm} max_scale={best_rms}")
+
+    # Phase 3: Full MR grid with best EMA + Regime, across spread levels
+    print(f"\n--- Phase 3: Full MR grid (EMA bot: s={best_es*ema_scale}/l={best_el*ema_scale}"
+          f"/ms={best_ems*ema_scale}/ml={best_eml*ema_scale}, "
+          f"regime mid={best_rm}/scale={best_rms}) ---")
+    for spread_bps in SPREAD_BPS_LIST:
+        half_spread = spread_bps / 2.0
+        print(f"\n--- Residual spread cost: {spread_bps} bps (half={half_spread} bps) ---")
+        results = []
+        for e, s, t, r in product(ENTRY_LIST, STOP_LIST, TP_LIST, REVERT_LIST):
+            trades, wins, pnl, max_dd, avg_hold = backtest_mr(
+                prices, best_trend_arr, e, s, t, r,
+                equity=EQUITY, order_size_pct=ORDER_SIZE_PCT, half_spread_bps=half_spread,
+                macro_bps_arr=best_macro_arr, regime_mid=best_rm, max_scale=best_rms,
+            )
+            tpm = trades / (duration_min / 10.0) if duration_min > 0 else 0
+            if tpm >= MIN_TRADES_PER_10MIN:
+                params = f"e={e:>3} s={s:>3} t={t:>3} r={r:>3}"
+                results.append((pnl, params, trades, wins, max_dd, avg_hold, tpm))
+        results.sort(key=lambda x: -x[0])
+        hdr_params = "                params"
+        print(f"\n{hdr_params} | {'trades':>6} {'wins':>5} {'winR':>5} | {'PnL':>9} {'maxDD':>8} | {'t/10m':>5} {'hold':>6}")
+        print("-" * 100)
+        for row in results[:10]:
+            pnl, params, trades, wins, max_dd, avg_hold, tpm = row
+            print(fmt_row(params, trades, wins, pnl, max_dd, avg_hold, tpm, tick_sec))
+        if results:
+            best = results[0]
+            update_grand("MR", spread_bps, best[0], best[1], best[2], best[3], best[4])
+        print(f"  ({len(results)} combos with >= {MIN_TRADES_PER_10MIN} trades/10min)")
 
     # ---------- 2. Trend Follow (default EMA) ----------
     print("\n" + "=" * 130)

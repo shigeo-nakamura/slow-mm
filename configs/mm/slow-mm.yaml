@@ -13,22 +13,24 @@ interval_secs: 5              # 5s cycle for tighter stop-loss execution
 # Position sizing
 order_size_pct: 0.10          # 10% of equity per trade
 
-# EMA parameters
+# EMA parameters (optimized for HYPE via 30-day backtest with macro EMA scaling fix)
 ema_short_periods: 4
-ema_long_periods: 20
+ema_long_periods: 12
+ema_macro_short_periods: 8
+ema_macro_long_periods: 40
 
-# Mean-reversion parameters (optimized via 30-day backtest WITH spread cost)
+# Mean-reversion parameters (optimized via 30-day backtest WITH spread cost + macro EMA fix)
 # HYPE spread: median 4.7bps (half=2.4bps/side). Entry/TP/revert auto-scale with regime.
-# Backtest @4bp: PnL=$1592/30d, 76% win, maxDD $14.24, e=20 s=80 t=15 r=10
-tf_entry_threshold_bps: 20.0  # Base entry (range); trend scales up
+# Backtest @4bp: PnL=$1334/30d, 64% win, maxDD $12.82, e=10 s=80 t=5 r=10
+tf_entry_threshold_bps: 10.0  # Base entry (range); trend scales up
 stop_loss_bps: 80.0           # Wide stop-loss
-tf_take_profit_bps: 15.0      # Base TP (range); trend scales up
+tf_take_profit_bps: 5.0       # Base TP (range); trend scales up
 mr_revert_bps: 10.0           # Base revert (range); trend scales up
 tf_cooldown_secs: 60          # 60s cooldown after close
 
 # Regime scaling: scale entry/tp/revert by macro trend strength
 regime_mid_bps: 10.0          # Baseline for scaling (scale=macro/this)
-regime_max_scale: 2.5         # Cap on scale factor
+regime_max_scale: 2.0         # Cap on scale factor
 
 # Trend pause: skip MR entry when macro EMA divergence exceeds this threshold.
 # Prevents counter-trend entries during strong directional moves.

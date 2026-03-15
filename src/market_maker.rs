@@ -44,6 +44,8 @@ const DEFAULT_TREND_WINDOW: usize = 5;
 const DEFAULT_TREND_THRESHOLD_BPS: f64 = 3.0;
 const DEFAULT_EMA_SHORT_PERIODS: usize = 5;
 const DEFAULT_EMA_LONG_PERIODS: usize = 20;
+const DEFAULT_EMA_MACRO_SHORT_PERIODS: usize = 10;
+const DEFAULT_EMA_MACRO_LONG_PERIODS: usize = 50;
 const DEFAULT_TREND_STRENGTH_THRESHOLD: f64 = 2.0;
 const DEFAULT_AGGRESSIVE_UNWIND_BPS: f64 = 0.0;
 const DEFAULT_POST_FILL_SPREAD_MULT: f64 = 2.0;
@@ -99,6 +101,8 @@ struct MmYaml {
     trend_threshold_bps: Option<f64>,
     ema_short_periods: Option<usize>,
     ema_long_periods: Option<usize>,
+    ema_macro_short_periods: Option<usize>,
+    ema_macro_long_periods: Option<usize>,
     trend_strength_threshold: Option<f64>,
     aggressive_unwind_bps: Option<f64>,
     post_fill_spread_mult: Option<f64>,
@@ -179,6 +183,10 @@ pub struct MmConfig {
     pub ema_short_periods: usize,
     /// EMA long period for trend detection
     pub ema_long_periods: usize,
+    /// Macro EMA short period for regime detection
+    pub ema_macro_short_periods: usize,
+    /// Macro EMA long period for regime detection
+    pub ema_macro_long_periods: usize,
     /// EMA trend strength threshold in bps: pause BOTH sides when |EMA_short - EMA_long| exceeds this
     pub trend_strength_threshold: f64,
     /// When holding inventory, place unwind order at entry_price ± this bps (0 = disabled)
@@ -294,6 +302,12 @@ impl MmConfig {
             ema_long_periods: yaml
                 .ema_long_periods
                 .unwrap_or(DEFAULT_EMA_LONG_PERIODS),
+            ema_macro_short_periods: yaml
+                .ema_macro_short_periods
+                .unwrap_or(DEFAULT_EMA_MACRO_SHORT_PERIODS),
+            ema_macro_long_periods: yaml
+                .ema_macro_long_periods
+                .unwrap_or(DEFAULT_EMA_MACRO_LONG_PERIODS),
             trend_strength_threshold: yaml
                 .trend_strength_threshold
                 .unwrap_or(DEFAULT_TREND_STRENGTH_THRESHOLD),
@@ -393,6 +407,8 @@ impl MmConfig {
             trend_threshold_bps: parse_env("TREND_THRESHOLD_BPS", DEFAULT_TREND_THRESHOLD_BPS),
             ema_short_periods: parse_env("EMA_SHORT_PERIODS", DEFAULT_EMA_SHORT_PERIODS),
             ema_long_periods: parse_env("EMA_LONG_PERIODS", DEFAULT_EMA_LONG_PERIODS),
+            ema_macro_short_periods: parse_env("EMA_MACRO_SHORT_PERIODS", DEFAULT_EMA_MACRO_SHORT_PERIODS),
+            ema_macro_long_periods: parse_env("EMA_MACRO_LONG_PERIODS", DEFAULT_EMA_MACRO_LONG_PERIODS),
             trend_strength_threshold: parse_env(
                 "TREND_STRENGTH_THRESHOLD",
                 DEFAULT_TREND_STRENGTH_THRESHOLD,
@@ -2884,10 +2900,10 @@ impl MmEngine {
         }
     }
 
-    /// Update macro EMA (EMA10/EMA50) for trend pause detection.
+    /// Update macro EMA for trend pause / regime detection.
     fn update_macro_ema(&mut self, mid: f64) {
-        let alpha_s = 2.0 / (10.0 + 1.0);
-        let alpha_l = 2.0 / (50.0 + 1.0);
+        let alpha_s = 2.0 / (self.cfg.ema_macro_short_periods as f64 + 1.0);
+        let alpha_l = 2.0 / (self.cfg.ema_macro_long_periods as f64 + 1.0);
         self.macro_ema_short = Some(match self.macro_ema_short {
             Some(prev) => alpha_s * mid + (1.0 - alpha_s) * prev,
             None => mid,
